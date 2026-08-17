@@ -89,12 +89,27 @@ def extract_archive(staging: Path) -> Path:
     return release
 
 
+def checked_target_root() -> Path:
+    target = EPUBCHECK_ROOT / "target"
+    if target.is_symlink() or target.is_junction():
+        raise ValueError(f"拒绝使用链接目录：{target}")
+    epubcheck = EPUBCHECK_ROOT.resolve()
+    resolved = target.resolve()
+    try:
+        epubcheck.relative_to(ROOT.resolve())
+        resolved.relative_to(epubcheck)
+    except ValueError as error:
+        raise ValueError(f"EPUBCheck target 越出仓库：{target}") from error
+    return resolved
+
+
 def install() -> None:
     if not (EPUBCHECK_ROOT / "pom.xml").is_file():
         raise FileNotFoundError(
             "EPUBCheck 子模块未初始化；请运行："
             "git submodule update --init --depth 1 tools/epubcheck"
         )
+    target_root = checked_target_root()
     if (
         EPUBCHECK_JAR.is_file()
         and VERSION_FILE.is_file()
@@ -107,7 +122,6 @@ def install() -> None:
 
     download_archive()
     try:
-        target_root = EPUBCHECK_ROOT / "target"
         target_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=".bookloom-", dir=target_root
