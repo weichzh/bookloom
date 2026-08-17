@@ -1,0 +1,20 @@
+* text=auto eol=lf
+
+# Markdown hard breaks and empty terminal TSV fields are semantic, not whitespace errors.
+*.md whitespace=-blank-at-eol,-blank-at-eof
+*.tsv whitespace=-blank-at-eol
+# A final blank line can terminate a paragraph across a LaTeX \input boundary.
+*.tex whitespace=-blank-at-eof
+# Git books can contain literal conflict examples; formal Markdown validates them by fence.
+Works/**/zh-CN/*.md conflict-marker-size=64
+Works/**/zh-CN/**/*.md conflict-marker-size=64
+
+*.epub binary
+*.gif binary
+*.jar binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.woff binary
+*.woff2 binary

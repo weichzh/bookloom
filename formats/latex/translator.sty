@@ -1,0 +1,7 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{translator}[2026/07/25 Translator semantic helpers]
+
+\newcommand{\sourcepage}[1]{\ifhmode\unskip\fi}
+\newcommand{\cnconcept}[2]{{\ifcsname kaishu\endcsname\kaishu\fi#1}（\emph{#2}）}
+\newcommand{\epubfallback}[3]{#3}
+\newenvironment{translatorverse}{\begin{verse}}{\end{verse}}

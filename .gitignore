@@ -1,0 +1,46 @@
+# Private source and work libraries
+/Books/
+/Works/
+
+# Project-local evidence, caches, and attachments
+/.tmp/
+/.local/
+/.codex-remote-attachments/
+/.ruff_cache/
+/.pytest_cache/
+/.mypy_cache/
+/.coverage
+**/__pycache__/
+*.py[cod]
+
+# Python and JavaScript environments
+/.venv/
+/venv/
+/node_modules/
+
+# Generated TeX files and editor backups
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.bak
+*.orig
+*~
+
+# Local secrets and editor/OS state
+/.codex/
+.env
+.env.*
+!.env.example
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Accidental root-level scratch files retained locally
+/\!i.complete
+/e.innerText)
+/out.txt

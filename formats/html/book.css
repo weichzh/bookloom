@@ -1,0 +1,67 @@
+:root {
+  color-scheme: light;
+  font-family: "Libertinus Serif", "Source Han Serif SC", serif;
+  line-height: 1.65;
+}
+
+body {
+  margin: 0;
+  color: #181818;
+  background: #fff;
+}
+
+main,
+article {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 5rem;
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.25;
+}
+
+blockquote {
+  margin-inline: 2rem;
+}
+
+.index-head {
+  margin: 1.2em 0 0.35em;
+  font-weight: bold;
+}
+
+.index-2 {
+  margin: 0.15em 0;
+  padding-left: 1.5em;
+}
+
+.index-2 p {
+  margin: 0.15em 0;
+  text-indent: 0;
+}
+
+.source-page {
+  display: none;
+}
+
+.cn-concept::after {
+  content: "（" attr(data-original) "）";
+  font-style: italic;
+}
+
+.verse,
+.line-block {
+  width: fit-content;
+  margin-inline: auto;
+  white-space: pre-line;
+}
+
+@media print {
+  main,
+  article {
+    max-width: none;
+    padding: 0;
+  }
+}

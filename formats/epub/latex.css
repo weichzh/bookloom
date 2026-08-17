@@ -1,0 +1,30 @@
+figcaption {
+  display: block;
+}
+
+.titlepage,
+.titlepage p {
+  text-align: center;
+  text-indent: 0;
+}
+
+.definition,
+.theorem,
+.lemma,
+.proposition,
+.remark,
+.example,
+.exercise {
+  border-left: 0.25em solid #4d8194;
+  margin: 1.2em 0;
+  padding: 0.4em 1em;
+}
+
+.equation {
+  overflow-x: auto;
+}
+
+.center {
+  max-width: 100%;
+  overflow-x: auto;
+}
