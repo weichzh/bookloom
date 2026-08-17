@@ -157,7 +157,7 @@ PDF 使用连续 `source-page`；没有固定页码的 EPUB 使用连续 `source
 
 1. 为冻结范围做一次来源审计；每个分段内部完成逐页原图核对。
 2. 每次调用作品 CLI 前，用 `--activity` 声明自上一工站后的来源核对、翻译、结构／样式修复或审校；文件净变化由 CLI 自动记录。
-3. 合入后运行 `uv run tools/translator.py prepare 'Works/<书名>' --activity ...`，由 CLI 依次完成中文 Markdown 的 AutoCorrect、lint 和 `check`；随后只用 `refresh --lang ... --target ...` 检查并重建受影响输出，已变化的单个输出仍完整构建和验收。
+3. 合入后运行 `uv run python tools/translator.py prepare 'Works/<书名>' --activity ...`，由 CLI 依次完成中文 Markdown 的 AutoCorrect、lint 和 `check`；随后只用 `refresh --lang ... --target ...` 检查并重建受影响输出，已变化的单个输出仍完整构建和验收。
 4. 全部范围合入后只建立一个终态候选，并执行一轮与初译分开的只读审校。
 5. 主 Agent 修复 blocking 问题，只 refresh 受影响目标与必要回归；非阻塞建议不扩张冻结范围。
 6. 对最终候选运行一次全量 `finalize`，完成全部 manifest 输出的机械检查、构建和证据生成；PDF 来源页渲染统一使用 `mutool`。
@@ -209,8 +209,8 @@ EPUB：
 
 最后运行：
 
-```powershell
-uv run tools/translator.py clean 'Works\<书名>' --activity delivery
+```shell
+uv run python tools/translator.py clean 'Works/<书名>' --activity delivery
 ```
 
 `clean` 只清理该书在仓库 `.tmp/translator/` 中的诊断目录；其他临时脚本、页面图、解包目录和分片仍由本任务显式删除。

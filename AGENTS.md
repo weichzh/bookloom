@@ -50,7 +50,7 @@
 
 ## 构建与证据
 
-- 统一入口是 `uv run tools/translator.py`；参数以 `--help` 为准，稳定契约见 `docs/codebase/CONTRACTS.md`。
+- 统一入口是 `uv run python tools/translator.py`；参数以 `--help` 为准，稳定契约见 `docs/codebase/CONTRACTS.md`。
 - 调用解析既有作品的命令必须用 `--activity` 声明上一工站后的人工或 Agent 活动；紧邻的纯机器步骤写 `none`。迭代使用目标级 `refresh`，交付前只运行一次全量 `finalize`。
 - 静态证据、本地证据、真实目标证据和生产等价证据必须明确区分，不能互相冒充。
 - 只有来源范围全部视觉核对、正式底稿语义完整、目标语言无漏译、封面验收完成、全部成品重建且全量验收、`STATUS.md` 无阻塞疑点时，才能称一本书完成。

@@ -4613,13 +4613,26 @@ a&=b\\
                 stdout="ERROR sample",
                 stderr="",
             )
-            with mock.patch.object(translator.subprocess, "run", return_value=result):
-                with self.assertRaises(translator.CliError):
-                    translator.run_epubcheck(evidence / "sample.epub", evidence)
+            with mock.patch.object(translator, "ensure_epubcheck_ready"):
+                with mock.patch.object(
+                    translator.subprocess, "run", return_value=result
+                ):
+                    with self.assertRaises(translator.CliError):
+                        translator.run_epubcheck(evidence / "sample.epub", evidence)
             self.assertIn(
                 "ERROR sample",
                 (evidence / "epubcheck.txt").read_text(encoding="utf-8"),
             )
+
+    def test_epubcheck_missing_install_has_setup_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                translator, "EPUBCHECK_JAR", Path(directory) / "missing.jar"
+            ):
+                with self.assertRaisesRegex(
+                    translator.CliError, "git submodule update.*setup_epubcheck.py"
+                ):
+                    translator.ensure_epubcheck_ready()
 
     def test_epubcheck_uses_ascii_copy_for_non_ascii_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4627,10 +4640,11 @@ a&=b\\
             source = evidence / "数理逻辑.epub"
             source.write_bytes(b"epub")
             result = subprocess.CompletedProcess(["java"], 0, stdout="ok", stderr="")
-            with mock.patch.object(
-                translator.subprocess, "run", return_value=result
-            ) as run:
-                translator.run_epubcheck(source, evidence)
+            with mock.patch.object(translator, "ensure_epubcheck_ready"):
+                with mock.patch.object(
+                    translator.subprocess, "run", return_value=result
+                ) as run:
+                    translator.run_epubcheck(source, evidence)
             checked_path = Path(run.call_args.args[0][-1])
             self.assertNotEqual(checked_path, source)
             self.assertTrue(checked_path.name.isascii())

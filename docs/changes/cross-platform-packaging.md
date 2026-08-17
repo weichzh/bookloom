@@ -6,7 +6,7 @@ description: 统一 Bookloom 的许可证、跨平台入口、持续集成和 EP
 
 ## Status
 
-accepted
+implemented
 
 ## Problem
 
@@ -19,6 +19,7 @@ accepted
 - 统一 Windows、macOS 和 Linux 可执行的 Python 入口，补充三平台 CI。
 - 用固定版本的官方 `w3c/epubcheck` Git submodule 替换内置发行包，并提供最小的跨平台构建和定位方式。
 - 补齐克隆、安装、外部依赖、子模块、测试和书籍隐私边界文档。
+- 删除根目录三个误生成文件及其专用忽略规则。
 
 不打包或公开 `Books/`、`Works/`，不发布 PyPI 包，不改动书籍内容。
 
@@ -32,8 +33,12 @@ accepted
 
 ## Result
 
-待实施。
+- 项目元数据和锁文件已统一为 `bookloom`，根目录使用 MIT 许可证。
+- 主入口统一为显式 Python 调用；三平台 GitHub Actions 执行锁文件、依赖准备、文档与完整测试。
+- 官方 EPUBCheck v5.3.0 源码固定为子模块；标准库安装脚本验证官方发行包 SHA-256，运行文件不进入父仓库。
+- README 和现有事实所有者已补充跨平台安装、依赖、命令、验证与隐私边界。
+- Windows 本地验证包括 EPUBCheck 真实启动，以及 116 项测试和 28 个子测试；未使用或修改 `Books/`、`Works/`。
 
 ## Review
 
-待复核。
+待独立复核。

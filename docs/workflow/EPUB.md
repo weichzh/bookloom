@@ -167,7 +167,7 @@ EPUB 3 Navigation Document 是唯一当前导航事实源：
 
 ## 浏览器渲染验收
 
-通用 EPUB 不绑定 Calibre。最终哈希对应的正式 EPUB 使用 `uv run tools/translator.py browser-qa 'Works/<书名>' --activity visual-qa` 解包到仓库 `.tmp/`，并由隔离的无头 `agent-browser` 直接执行全部 XHTML、CSS 和 SVG；代表页至少抽查：
+通用 EPUB 不绑定 Calibre。最终哈希对应的正式 EPUB 使用 `uv run python tools/translator.py browser-qa 'Works/<书名>' --activity visual-qa` 解包到仓库 `.tmp/`，并由隔离的无头 `agent-browser` 直接执行全部 XHTML、CSS 和 SVG；代表页至少抽查：
 
 - 书架元数据、封面和书名页；
 - toc、landmarks、章节跳转和返回；
@@ -187,7 +187,7 @@ Windows 上首次命令启动持久 daemon 时，stdout/stderr 管道可能被 d
 
 `close` 成功后，Windows 上的 `session list` 仍可能保留已经没有进程的陈旧 session 名；反复精确关闭也可能以连接超时结束。验收入口只记录关闭结果和 `cleanup_required`，不得用 `doctor`、`close --all`、全局进程终止或跨 namespace 删除来清理这类工具状态。
 
-EPUBCheck 证明规范结构，不证明浏览器正确显示；浏览器检查也不证明所有品牌阅读器像素级一致。最后一次修复后必须重建，并对新哈希重跑受影响的全部检查。
+EPUBCheck 证明规范结构，不证明浏览器正确显示；浏览器检查也不证明所有品牌阅读器像素级一致。官方源码以 Git submodule 固定，运行文件由 `uv run python scripts/setup_epubcheck.py` 下载同版本发行包并验证 SHA-256，不进入父仓库。最后一次修复后必须重建，并对新哈希重跑受影响的全部检查。
 
 ## 完成与证据
 

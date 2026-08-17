@@ -39,8 +39,3 @@
 .DS_Store
 Thumbs.db
 Desktop.ini
-
-# Accidental root-level scratch files retained locally
-/\!i.complete
-/e.innerText)
-/out.txt

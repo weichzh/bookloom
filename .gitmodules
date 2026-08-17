@@ -1,0 +1,4 @@
+[submodule "epubcheck"]
+	path = tools/epubcheck
+	url = https://github.com/w3c/epubcheck.git
+	shallow = true

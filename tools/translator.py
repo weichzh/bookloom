@@ -153,7 +153,9 @@ TOOL_TRUNCATION_RE = re.compile(
     r"|…[0-9]+(?:,[0-9]{3})* tokens? truncated…"
     r"|\.\.\.[0-9]+(?:,[0-9]{3})* tokens? truncated\.\.\."
 )
-EPUBCHECK_JAR = REPO_ROOT / "tools" / "epubcheck" / "epubcheck.jar"
+EPUBCHECK_JAR = (
+    REPO_ROOT / "tools" / "epubcheck" / "target" / "bookloom" / "epubcheck.jar"
+)
 QA_DEFAULT_DPI = 100
 BROWSER_QA_DEFAULTS = {
     "width": 390,
@@ -5114,7 +5116,18 @@ def qa_html(output: Path, evidence: Path) -> None:
     )
 
 
+def ensure_epubcheck_ready() -> None:
+    if EPUBCHECK_JAR.is_file():
+        return
+    raise CliError(
+        "EPUBCheck 未准备好；请依次运行："
+        "git submodule update --init --depth 1 tools/epubcheck；"
+        "uv run python scripts/setup_epubcheck.py"
+    )
+
+
 def run_epubcheck(output: Path, evidence: Path) -> None:
+    ensure_epubcheck_ready()
     output_text = str(output)
     with tempfile.TemporaryDirectory(
         prefix="epubcheck-",

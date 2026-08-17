@@ -3,6 +3,21 @@ revision = 3
 requires-python = ">=3.12"
 
 [[package]]
+name = "bookloom"
+version = "0.1.0"
+source = { virtual = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.1.1" }]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://mirrors.cloud.tencent.com/pypi/simple/" }
@@ -62,18 +77,3 @@ sdist = { url = "https://mirrors.cloud.tencent.com/pypi/packages/e4/47/b9efed96c
 wheels = [
     { url = "https://mirrors.cloud.tencent.com/pypi/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c" },
 ]
-
-[[package]]
-name = "translator"
-version = "0.1.0"
-source = { virtual = "." }
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.1.1" }]

@@ -4,4 +4,4 @@
 
 当前 shared-change：
 
-- [跨平台发布与依赖整理](changes/cross-platform-packaging.md)
+- shared-change: `docs/changes/cross-platform-packaging.md`

@@ -56,12 +56,13 @@ outputs = { pdf = "output/example-book.zh.pdf" }
 
 ## 流程 CLI
 
-- `uv run tools/translator.py prepare WORK --activity ...` 对中文 Markdown 入口依次运行 AutoCorrect 修复、lint 和 `check`；随后只能使用目标级 `refresh` 或一次性 `finalize`。
+- `uv run python tools/translator.py prepare WORK --activity ...` 对中文 Markdown 入口依次运行 AutoCorrect 修复、lint 和 `check`；随后只能使用目标级 `refresh` 或一次性 `finalize`。
 - `check` 会在存在可识别状态声明时比较 manifest 与 `STATUS.md`；两者不一致必须先修正，不能继续构建。LaTeX 作品声明 EPUB 输出时，`check` 还会复用正式展开、规范化和 Pandoc/Lua 过滤链做快速预检，但不生成公式或写正式输出。
 - 同一作品／会话的工站 lane 由 CLI 互斥；锁文件只在 `.local/translator/state/`，由进程退出自动释放。
 - PDF 来源页数、来源页渲染和 QA 统一以 `mutool` 为入口，不依赖 `pdftoppm.cmd` 包装器。
 - `doctor --for all` 还扫描 `README.md`、`AGENTS.md`、`CONTEXT.md` 和 `docs/**/*.md` 中的本地 Python 入口；不存在或不唯一的路径属于文档入口漂移，必须先修复。
 - 共享回归使用项目 uv 环境：`uv run pytest -q`；`uv run python -m unittest discover -s tests -p "test_*.py"` 作为无插件后备入口。
+- 官方 EPUBCheck 源码固定为 `tools/epubcheck` 子模块；运行文件由 `uv run python scripts/setup_epubcheck.py` 校验并安装到子模块忽略的 `target/bookloom/`。主仓库不保存 JAR，缺少子模块或运行文件时 EPUB QA 必须给出准备命令并停止。
 
 ## 派生 EPUB 与证据
 
