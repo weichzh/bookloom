@@ -37,8 +37,10 @@ implemented
 - 主入口统一为显式 Python 调用；三平台 GitHub Actions 执行锁文件、依赖准备、文档与完整测试。
 - 官方 EPUBCheck v5.3.0 源码固定为子模块；标准库安装脚本验证官方发行包 SHA-256，运行文件不进入父仓库。
 - README 和现有事实所有者已补充跨平台安装、依赖、命令、验证与隐私边界。
-- Windows 本地验证包括 EPUBCheck 真实启动，以及 116 项测试和 28 个子测试；未使用或修改 `Books/`、`Works/`。
+- Windows 本地验证包括 EPUBCheck 真实启动，以及 117 项测试和 28 个子测试；未使用或修改 `Books/`、`Works/`。
 
 ## Review
 
-待独立复核。
+- Spec 轴无发现：许可证、改名、三平台 CI、子模块、文档、隐私边界和误生成文件清理均符合范围。
+- Standards 轴发现并阻断了 `target` 链接可能导致安装清理越界的问题；`a8f3354` 增加解析后 containment、链接拒绝和回归测试，复核确认 blocking 已关闭。
+- 没有 non-blocking 或 out-of-scope 发现。
