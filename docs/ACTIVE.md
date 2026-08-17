@@ -2,4 +2,6 @@
 
 本文件只登记当前可执行工作流的路由；具体状态由所指向的所有者保存。
 
-当前没有 shared-change。
+当前 shared-change：
+
+- [跨平台发布与依赖整理](changes/cross-platform-packaging.md)
