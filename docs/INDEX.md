@@ -15,7 +15,6 @@
 | [AGENTS.md](../AGENTS.md) | 启动与硬规则 | all |
 | [CONTEXT.md](../CONTEXT.md) | 稳定目标、目录与所有权 | all |
 | [docs/ACTIVE.md](ACTIVE.md) | 当前执行指针 | all |
-| [docs/changes/cross-platform-packaging.md](changes/cross-platform-packaging.md) | 当前跨平台发布与依赖整理 | shared-change |
 | [docs/workflow/PROTOCOL.md](workflow/PROTOCOL.md) | 任务与变更生命周期 | audit, book, shared-change |
 | [docs/codebase/CONTRACTS.md](codebase/CONTRACTS.md) | manifest、CLI 与日志机器语义 | book, shared-change |
 | [docs/workflow/TRANSLATION.md](workflow/TRANSLATION.md) | 内容恢复、翻译与交付流程 | book |
