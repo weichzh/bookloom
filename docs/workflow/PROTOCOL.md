@@ -26,7 +26,7 @@
 - non-blocking：可在不影响本次验收时留作候选，不扩大冻结范围。
 - out-of-scope：登记到所有者或路线图，不纳入本次变更。
 
-所有 blocking 关闭且验收条件满足时停止审查。先以 `implemented` 提交结果和证据，复核完成后删除 change、清空 `ACTIVE` 指针；Git 是唯一历史档案。
+所有 blocking 关闭且验收条件满足时停止审查。先以 `implemented` 记录结果和证据；获准提交并进入 Git 历史后删除 change、清空 `ACTIVE` 指针。未经授权不自动提交，保留 implemented 记录供用户审阅；Git 是唯一历史档案。
 
 ## 工站与持续改进
 
@@ -44,6 +44,10 @@
 ## 协作
 
 主 Agent 独占 change、`ACTIVE`、共享入口和最终合入；子 Agent 只处理互不重叠的代码、测试、章节或只读 review。所有分片由主 Agent 复核，不能把子 Agent 的结论直接当作完成。
+
+委派必须写明对象、文件边界、CWD、预算、成功条件及返回证据。子 Agent 用 `scratch` 取得 `.tmp/translator/<work-key>/scratch/<agent>/`；截图、提取、脚本和草稿均在此目录。主 Agent 收齐分片、检查实际 diff／来源／关键验证，确认所有写入者结束后统一 `clean`。不逐个用 shell 删除，不新增任意路径清理入口；终态、完成和交付回执保留在 `.local/translator/evidence/`。
+
+当前范围已获批准时，段落、术语、内部审查和临时文件管理由 Agent 自行处理，不要求用户重复审核。发现实质范围变化或未授权外部写入才请求用户决定。安全层拒绝的操作不得换工具重试；统一入口减少重复操作，不承诺任何命令永不触发审核。
 
 ## 完成门槛
 

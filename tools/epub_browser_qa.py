@@ -16,9 +16,101 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
 KNOWN_VIEWPORT_EOF = "EOF while parsing a value"
+PUBLISHER_MODE = "publisher-default"
+READER_DARK_MODE = "reader-dark"
+READER_LARGE_PRINT_MODE = "reader-large-print"
+ALL_MODES = "all"
+DEFAULT_VIEWPORT = (390, 844)
+DEFAULT_MODE_NAMES = (
+    PUBLISHER_MODE,
+    READER_DARK_MODE,
+    READER_LARGE_PRINT_MODE,
+)
+
+
+def mode_definition(
+    name: str,
+    *,
+    width: int,
+    height: int,
+    color_scheme: str | None,
+    disable_publisher_css: bool,
+    user_font_family: str | None,
+    user_font_size_px: int | None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "viewport": [width, height],
+        "color_scheme": color_scheme,
+        "disable_publisher_css": disable_publisher_css,
+        "user_font_family": user_font_family,
+        "user_font_size_px": user_font_size_px,
+    }
+
+
+def default_modes(
+    width: int = DEFAULT_VIEWPORT[0], height: int = DEFAULT_VIEWPORT[1]
+) -> list[dict[str, Any]]:
+    """Return the production reader matrix in deterministic order.
+
+    The first viewport remains configurable for the existing diagnostic CLI,
+    while the two reader modes retain their documented dimensions unless a
+    caller explicitly selects one of them.
+    """
+
+    return [
+        mode_definition(
+            PUBLISHER_MODE,
+            width=width,
+            height=height,
+            color_scheme="light",
+            disable_publisher_css=False,
+            user_font_family=None,
+            user_font_size_px=None,
+        ),
+        mode_definition(
+            READER_DARK_MODE,
+            width=1280,
+            height=900,
+            color_scheme="dark",
+            disable_publisher_css=False,
+            user_font_family=None,
+            user_font_size_px=None,
+        ),
+        mode_definition(
+            READER_LARGE_PRINT_MODE,
+            width=390,
+            height=844,
+            color_scheme="light",
+            disable_publisher_css=True,
+            user_font_family="serif",
+            user_font_size_px=32,
+        ),
+    ]
+
+
+def selected_modes(
+    mode: str,
+    *,
+    width: int,
+    height: int,
+) -> list[dict[str, Any]]:
+    """Resolve a matrix or a deliberately selected diagnostic mode."""
+
+    modes = default_modes(width, height)
+    if mode == ALL_MODES:
+        return modes
+    if mode not in DEFAULT_MODE_NAMES:
+        raise BrowserQAError(
+            f"未知浏览器模式：{mode}；可用值为 all、{', '.join(DEFAULT_MODE_NAMES)}"
+        )
+    if mode == PUBLISHER_MODE:
+        return [modes[0]]
+    return [item for item in modes if item["name"] == mode]
+
+
 HARNESS = r"""<!doctype html>
 <meta charset="utf-8">
 <title>EPUB browser QA</title>
@@ -31,13 +123,105 @@ HARNESS = r"""<!doctype html>
   const pages = __PAGES__;
   const pageTimeout = __PAGE_TIMEOUT__;
   const expectedViewport = [__WIDTH__, __HEIGHT__];
+  const modeSettings = __MODE_SETTINGS__;
   const state = (window.qaState = { done: false, results: [], errors: [] });
   const frame = document.querySelector("#reader");
+  let pageReaderSettings = null;
+
+  function applyReaderMode(document) {
+    const publisherNodes = [
+      ...document.querySelectorAll("link[rel~='stylesheet'], style"),
+    ];
+    const inlineStyleNodes = [...document.querySelectorAll("[style]")];
+    let removedPublisherStyleCount = 0;
+    let removedInlineStyleCount = 0;
+    if (modeSettings.disable_publisher_css) {
+      for (const node of publisherNodes) {
+        node.remove();
+        removedPublisherStyleCount += 1;
+      }
+      for (const node of inlineStyleNodes) {
+        node.removeAttribute("style");
+        removedInlineStyleCount += 1;
+      }
+    }
+    let override = document.querySelector("#qa-reader-overrides");
+    if (override) override.remove();
+    const rules = [];
+    if (modeSettings.user_font_family) {
+      rules.push(
+        `html, body, body * { font-family: ${modeSettings.user_font_family} !important; }`,
+      );
+    }
+    if (modeSettings.user_font_size_px) {
+      rules.push(`html { font-size: ${modeSettings.user_font_size_px}px !important; }`);
+    }
+    if (modeSettings.disable_publisher_css) {
+      rules.push(
+        "html, body, body * { overflow-wrap: anywhere !important; word-break: break-word !important; }",
+      );
+    }
+    if (rules.length) {
+      override = document.createElement("style");
+      override.id = "qa-reader-overrides";
+      override.textContent = rules.join("\n");
+      (document.head || document.documentElement).append(override);
+    }
+    const computedHtml = getComputedStyle(document.documentElement);
+    const computedBody = getComputedStyle(document.body);
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    const light = matchMedia("(prefers-color-scheme: light)").matches;
+    const actualColorScheme = dark ? "dark" : light ? "light" : "no-preference";
+    const remainingPublisherNodes = [
+      ...document.querySelectorAll("link[rel~='stylesheet'], style:not(#qa-reader-overrides)"),
+    ].length;
+    const remainingInlineStyleNodes = document.querySelectorAll("[style]").length;
+    return {
+      mode: modeSettings.name,
+      requestedColorScheme: modeSettings.color_scheme || "default",
+      actualColorScheme,
+      disablePublisherCssRequested: Boolean(modeSettings.disable_publisher_css),
+      publisherCssDisabled: modeSettings.disable_publisher_css
+        ? remainingPublisherNodes === 0 && remainingInlineStyleNodes === 0
+        : false,
+      publisherStyleNodesBefore: publisherNodes.length,
+      publisherStyleNodesRemoved: removedPublisherStyleCount,
+      publisherStyleNodesRemaining: remainingPublisherNodes,
+      inlineStyleNodesBefore: inlineStyleNodes.length,
+      inlineStyleNodesRemoved: removedInlineStyleCount,
+      inlineStyleNodesRemaining: remainingInlineStyleNodes,
+      requestedFontFamily: modeSettings.user_font_family,
+      actualFontFamily: computedBody.fontFamily,
+      userFontApplied: modeSettings.user_font_family
+        ? computedBody.fontFamily.toLowerCase().includes(
+            modeSettings.user_font_family.toLowerCase(),
+          )
+        : false,
+      requestedFontSizePx: modeSettings.user_font_size_px,
+      actualFontSizePx: parseFloat(computedHtml.fontSize),
+      userFontSizeApplied: modeSettings.user_font_size_px
+        ? Math.abs(
+            parseFloat(computedHtml.fontSize) - modeSettings.user_font_size_px,
+          ) < 0.1
+        : false,
+      reflowWrapApplied: modeSettings.disable_publisher_css
+        ? ["anywhere", "break-word"].includes(computedBody.overflowWrap)
+        : false,
+    };
+  }
 
   function loadPage(path) {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error(`timeout ${path}`)), pageTimeout);
-      frame.onload = () => { clearTimeout(timeout); resolve(); };
+      frame.onload = () => {
+        clearTimeout(timeout);
+        try {
+          pageReaderSettings = applyReaderMode(frame.contentDocument);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      };
       frame.src = path;
     });
   }
@@ -188,6 +372,7 @@ HARNESS = r"""<!doctype html>
       overflowCount: overflowWidth > 1 ? 1 : 0,
       overflowWidth: Math.max(0, overflowWidth),
       overflowElements,
+      readerSettings: pageReaderSettings,
       ...navigation,
     };
   }
@@ -270,7 +455,7 @@ def safe_extract(epub: Path, destination: Path) -> list[str]:
         names = archive.namelist()
         for name in names:
             normalized = posixpath.normpath(name)
-            if normalized.startswith("../") or normalized.startswith("/"):
+            if normalized.startswith(("../", "/")):
                 raise BrowserQAError(f"EPUB 包含越界路径：{name}")
             target = (destination / normalized).resolve()
             try:
@@ -287,15 +472,28 @@ def write_harness(
     width: int,
     height: int,
     page_timeout: int,
+    mode_settings: dict[str, Any] | None = None,
+    *,
+    base_prefix: str = "../",
 ) -> list[str]:
-    paths = ["../" + member for member in members]
+    paths = [base_prefix + member for member in members]
+    settings = mode_settings or mode_definition(
+        PUBLISHER_MODE,
+        width=width,
+        height=height,
+        color_scheme=None,
+        disable_publisher_css=False,
+        user_font_family=None,
+        user_font_size_px=None,
+    )
     text = (
         HARNESS.replace("__PAGES__", json.dumps(paths, ensure_ascii=False))
         .replace("__WIDTH__", str(width))
         .replace("__HEIGHT__", str(height))
         .replace("__PAGE_TIMEOUT__", str(page_timeout * 1000))
+        .replace("__MODE_SETTINGS__", json.dumps(settings, ensure_ascii=False))
     )
-    path.parent.mkdir()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return paths
 
@@ -351,6 +549,7 @@ def run_agent(
             text=True,
             errors="replace",
             timeout=timeout,
+            check=False,
             **output,
         )
         detail = (result.stdout or "") + (result.stderr or "")
@@ -365,7 +564,11 @@ def run_agent(
 
 
 def result_failures(
-    state: dict[str, Any], expected: list[str], width: int, height: int
+    state: dict[str, Any],
+    expected: list[str],
+    width: int,
+    height: int,
+    mode_settings: dict[str, Any] | None = None,
 ) -> list[str]:
     failures = [str(item) for item in state.get("errors", [])]
     results = state.get("results", [])
@@ -403,6 +606,32 @@ def result_failures(
             if offenders:
                 detail += f" offenders={offenders}"
             failures.append(f"{path}: overflowCount={item['overflowCount']}{detail}")
+        if mode_settings is not None:
+            actual = item.get("readerSettings")
+            if not isinstance(actual, dict):
+                failures.append(f"{path}: readerSettings 缺失")
+                continue
+            expected_scheme = mode_settings.get("color_scheme")
+            if expected_scheme and actual.get("actualColorScheme") != expected_scheme:
+                failures.append(
+                    f"{path}: colorScheme={actual.get('actualColorScheme')}"
+                )
+            if mode_settings.get("disable_publisher_css") and not actual.get(
+                "publisherCssDisabled"
+            ):
+                failures.append(f"{path}: publisherCssDisabled=false")
+            if mode_settings.get("user_font_family") and not actual.get(
+                "userFontApplied"
+            ):
+                failures.append(f"{path}: userFontApplied=false")
+            if mode_settings.get("user_font_size_px") and not actual.get(
+                "userFontSizeApplied"
+            ):
+                failures.append(f"{path}: userFontSizeApplied=false")
+            if mode_settings.get("disable_publisher_css") and not actual.get(
+                "reflowWrapApplied"
+            ):
+                failures.append(f"{path}: reflowWrapApplied=false")
     return failures
 
 
@@ -428,33 +657,72 @@ def screenshot_paths(state: dict[str, Any], maximum: int) -> list[str]:
     return chosen
 
 
-def run_browser_qa(
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def mode_summary(payload: dict[str, Any]) -> list[str]:
+    settings = json.dumps(payload["settings"], ensure_ascii=False, sort_keys=True)
+    actual = json.dumps(
+        payload.get("actual_settings"), ensure_ascii=False, sort_keys=True
+    )
+    return [
+        f"mode={payload['mode']}",
+        f"settings={settings}",
+        f"actual_settings={actual}",
+        f"viewport={payload['viewport'][0]}x{payload['viewport'][1]}",
+        f"xhtml_count={payload['xhtml_count']}",
+        f"formula_count={payload['formula_count']}",
+        f"xhtml_link_count={payload['xhtml_link_count']}",
+        f"fragment_link_count={payload['fragment_link_count']}",
+        f"noteref_target_checks={payload['noteref_target_checks']}",
+        f"backlink_target_checks={payload['backlink_target_checks']}",
+        f"noteref_navigation_checks={payload['noteref_navigation_checks']}",
+        f"backlink_navigation_checks={payload['backlink_navigation_checks']}",
+        f"failures={len(payload['failures'])}",
+        (
+            "launch_timeout_recovered="
+            f"{str(payload['events']['launch_timeout_recovered']).lower()}"
+        ),
+        f"poll_timeouts={payload['events']['poll_timeouts']}",
+        (
+            "viewport_command_eof="
+            f"{str(payload['events']['viewport_command_eof']).lower()}"
+        ),
+        (f"close_returncode={payload['events']['close_returncode']}"),
+    ]
+
+
+def run_mode(
     epub: Path,
+    unpacked: Path,
+    members: list[str],
     evidence: Path,
+    digest: str,
+    namespace: str,
+    mode_settings: dict[str, Any],
     *,
-    width: int = 390,
-    height: int = 844,
-    timeout: int = 600,
-    page_timeout: int = 30,
-    screenshots: int = 6,
+    timeout: int,
+    page_timeout: int,
+    screenshots: int,
 ) -> dict[str, Any]:
-    if not epub.is_file():
-        raise BrowserQAError(f"EPUB 不存在：{epub}")
-    if min(width, height, timeout, page_timeout) <= 0 or screenshots < 0:
-        raise BrowserQAError("viewport、超时必须为正数，截图数量不能为负数")
-    if evidence.exists():
-        raise BrowserQAError(f"证据目录已经存在：{evidence}")
-    evidence.mkdir(parents=True)
-    unpacked = evidence / "unpacked"
-    members = safe_extract(epub, unpacked)
-    if not members:
-        raise BrowserQAError("EPUB 不含 XHTML")
-    harness = unpacked / "browser-qa" / "harness.html"
-    expected = write_harness(harness, members, width, height, page_timeout)
-    digest = sha256(epub)
-    project_key = hashlib.sha256(str(ROOT).encode("utf-8")).hexdigest()[:12]
-    namespace = f"translator-{project_key}"
-    session = f"epub-{digest[:10].lower()}-{os.getpid()}-{time.time_ns() % 1_000_000}"
+    mode = str(mode_settings["name"])
+    width, height = (int(value) for value in mode_settings["viewport"])
+    mode_dir = evidence / mode
+    mode_dir.mkdir(parents=True)
+    harness = mode_dir / "harness.html"
+    expected = write_harness(
+        harness,
+        members,
+        width,
+        height,
+        page_timeout,
+        mode_settings,
+        base_prefix="../unpacked/",
+    )
+    session = f"epub-{digest[:10].lower()}-{os.getpid()}-{mode}-{time.time_ns() % 1_000_000}"
     events: dict[str, Any] = {
         "namespace": namespace,
         "session": session,
@@ -463,22 +731,24 @@ def run_browser_qa(
         "cleanup_required": False,
         "poll_timeouts": 0,
         "viewport_command_eof": False,
+        "media_command": None,
+        "close_returncode": None,
     }
-    (evidence / "run.json").write_text(
-        json.dumps(
-            {
-                "epub": str(epub.resolve()),
-                "sha256": digest,
-                "namespace": namespace,
-                "session": session,
-                "viewport": [width, height],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    write_json(
+        mode_dir / "run.json",
+        {
+            "epub": str(epub.resolve()),
+            "sha256": digest,
+            "namespace": namespace,
+            "session": session,
+            "mode": mode,
+            "settings": mode_settings,
+            "viewport": [width, height],
+        },
     )
     state: dict[str, Any] | None = None
+    run_error: str | None = None
+    screenshot_errors: list[str] = []
     try:
         try:
             run_agent(
@@ -525,6 +795,10 @@ def run_browser_qa(
         )
         if dimensions != {"width": width, "height": height}:
             raise BrowserQAError(f"viewport 未生效：{dimensions}")
+        color_scheme = mode_settings.get("color_scheme")
+        if color_scheme:
+            run_agent(namespace, session, ["set", "media", color_scheme])
+            events["media_command"] = color_scheme
         run_agent(
             namespace,
             session,
@@ -548,9 +822,7 @@ def run_browser_qa(
             except subprocess.TimeoutExpired:
                 events["poll_timeouts"] += 1
                 continue
-            (evidence / "progress.json").write_text(
-                json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            write_json(mode_dir / "progress.json", progress)
             if progress.get("done"):
                 state = parse_json_output(
                     run_agent(namespace, session, ["eval", "qaState"]).stdout
@@ -560,8 +832,7 @@ def run_browser_qa(
         if state is None:
             raise BrowserQAError(f"浏览器验收超过 {timeout} 秒")
 
-        screenshot_errors: list[str] = []
-        screenshots_dir = evidence / "screenshots"
+        screenshots_dir = mode_dir / "screenshots"
         screenshots_dir.mkdir()
         for index, path in enumerate(screenshot_paths(state, screenshots), 1):
             try:
@@ -576,14 +847,10 @@ def run_browser_qa(
                 run_agent(namespace, session, ["screenshot", str(target.resolve())])
             except (BrowserQAError, OSError, subprocess.TimeoutExpired) as error:
                 screenshot_errors.append(f"{path}: 截图失败：{error}")
-    except BrowserQAError as error:
-        (evidence / "error.txt").write_text(str(error) + "\n", encoding="utf-8")
-        raise
-    except (OSError, subprocess.TimeoutExpired, zipfile.BadZipFile) as error:
-        (evidence / "error.txt").write_text(str(error) + "\n", encoding="utf-8")
-        raise BrowserQAError(str(error)) from error
+    except (BrowserQAError, OSError, subprocess.TimeoutExpired) as error:
+        run_error = str(error)
+        (mode_dir / "error.txt").write_text(run_error + "\n", encoding="utf-8")
     finally:
-        events["close_returncode"] = None
         for _ in range(3):
             try:
                 closed = run_agent(
@@ -602,70 +869,197 @@ def run_browser_qa(
                 break
         events["cleanup_required"] = events["close_returncode"] != 0
 
-    assert state is not None
-    failures = result_failures(state, expected, width, height) + screenshot_errors
+    if state is None:
+        state = {"errors": [], "results": []}
+    failures = (
+        result_failures(state, expected, width, height, mode_settings)
+        + screenshot_errors
+    )
+    if run_error:
+        failures.insert(0, run_error)
     if events["cleanup_required"]:
-        failures.append(
-            f"session 未关闭：namespace={namespace} session={session}"
-        )
-    payload = {
+        failures.append(f"session 未关闭：namespace={namespace} session={session}")
+    actual_settings = next(
+        (
+            item.get("readerSettings")
+            for item in state.get("results", [])
+            if isinstance(item.get("readerSettings"), dict)
+        ),
+        None,
+    )
+    results = state.get("results", [])
+    payload: dict[str, Any] = {
         "epub": str(epub.resolve()),
         "sha256": digest,
+        "mode": mode,
+        "settings": mode_settings,
+        "actual_settings": actual_settings,
         "viewport": [width, height],
         "xhtml_count": len(expected),
-        "formula_count": sum(item.get("formulaCount", 0) for item in state["results"]),
-        "xhtml_link_count": sum(
-            item.get("xhtmlLinkCount", 0) for item in state["results"]
-        ),
+        "formula_count": sum(item.get("formulaCount", 0) for item in results),
+        "xhtml_link_count": sum(item.get("xhtmlLinkCount", 0) for item in results),
         "fragment_link_count": sum(
-            item.get("fragmentLinkCount", 0) for item in state["results"]
+            item.get("fragmentLinkCount", 0) for item in results
         ),
         "noteref_target_checks": sum(
-            item.get("noterefTargetChecks", 0) for item in state["results"]
+            item.get("noterefTargetChecks", 0) for item in results
         ),
         "backlink_target_checks": sum(
-            item.get("backlinkTargetChecks", 0) for item in state["results"]
+            item.get("backlinkTargetChecks", 0) for item in results
         ),
         "noteref_navigation_checks": sum(
-            item.get("noterefNavigationChecks", 0) for item in state["results"]
+            item.get("noterefNavigationChecks", 0) for item in results
         ),
         "backlink_navigation_checks": sum(
-            item.get("backlinkNavigationChecks", 0) for item in state["results"]
+            item.get("backlinkNavigationChecks", 0) for item in results
         ),
         "failures": failures,
         "events": events,
-        "results": state["results"],
+        "results": results,
     }
-    (evidence / "results.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    write_json(mode_dir / "results.json", payload)
+    (mode_dir / "summary.txt").write_text(
+        "\n".join(mode_summary(payload)) + "\n", encoding="utf-8"
     )
-    (evidence / "summary.txt").write_text(
-        "\n".join(
-            (
-                f"epub={epub.resolve()}",
-                f"sha256={digest}",
-                f"viewport={width}x{height}",
-                f"xhtml_count={len(expected)}",
-                f"formula_count={payload['formula_count']}",
-                f"xhtml_link_count={payload['xhtml_link_count']}",
-                f"fragment_link_count={payload['fragment_link_count']}",
-                f"noteref_target_checks={payload['noteref_target_checks']}",
-                f"backlink_target_checks={payload['backlink_target_checks']}",
-                "noteref_navigation_checks="
-                f"{payload['noteref_navigation_checks']}",
-                "backlink_navigation_checks="
-                f"{payload['backlink_navigation_checks']}",
-                f"failures={len(failures)}",
-                "launch_timeout_recovered="
-                f"{str(events['launch_timeout_recovered']).lower()}",
-                f"poll_timeouts={events['poll_timeouts']}",
-                f"viewport_command_eof={str(events['viewport_command_eof']).lower()}",
-            )
+    return payload
+
+
+def run_browser_qa(
+    epub: Path,
+    evidence: Path,
+    *,
+    width: int = 390,
+    height: int = 844,
+    timeout: int = 600,
+    page_timeout: int = 30,
+    screenshots: int = 6,
+    mode: str = ALL_MODES,
+) -> dict[str, Any]:
+    if not epub.is_file():
+        raise BrowserQAError(f"EPUB 不存在：{epub}")
+    if min(width, height, timeout, page_timeout) <= 0 or screenshots < 0:
+        raise BrowserQAError("viewport、超时必须为正数，截图数量不能为负数")
+    if evidence.exists():
+        raise BrowserQAError(f"证据目录已经存在：{evidence}")
+    modes = selected_modes(mode, width=width, height=height)
+    evidence.mkdir(parents=True)
+    unpacked = evidence / "unpacked"
+    try:
+        members = safe_extract(epub, unpacked)
+    except (BrowserQAError, OSError, zipfile.BadZipFile) as error:
+        (evidence / "error.txt").write_text(str(error) + "\n", encoding="utf-8")
+        if isinstance(error, BrowserQAError):
+            raise
+        raise BrowserQAError(str(error)) from error
+    if not members:
+        error = BrowserQAError("EPUB 不含 XHTML")
+        (evidence / "error.txt").write_text(str(error) + "\n", encoding="utf-8")
+        raise error
+    digest = sha256(epub)
+    project_key = hashlib.sha256(str(ROOT).encode("utf-8")).hexdigest()[:12]
+    namespace = f"translator-{project_key}"
+    run_record = {
+        "epub": str(epub.resolve()),
+        "sha256": digest,
+        "mode": mode,
+        "namespace": namespace,
+        "modes": [
+            {
+                "name": item["name"],
+                "settings": item,
+                "viewport": item["viewport"],
+            }
+            for item in modes
+        ],
+    }
+    write_json(evidence / "run.json", run_record)
+    write_json(
+        evidence / "progress.json",
+        {"done": False, "mode_count": len(modes), "completed_modes": []},
+    )
+    mode_payloads: list[dict[str, Any]] = []
+    for item in modes:
+        payload = run_mode(
+            epub,
+            unpacked,
+            members,
+            evidence,
+            digest,
+            namespace,
+            item,
+            timeout=timeout,
+            page_timeout=page_timeout,
+            screenshots=screenshots,
         )
-        + "\n",
-        encoding="utf-8",
-    )
+        mode_payloads.append(payload)
+        write_json(
+            evidence / "progress.json",
+            {
+                "done": len(mode_payloads) == len(modes),
+                "mode_count": len(modes),
+                "completed_modes": [entry["mode"] for entry in mode_payloads],
+                "failures": {
+                    entry["mode"]: len(entry["failures"]) for entry in mode_payloads
+                },
+            },
+        )
+    failures = [
+        f"{item['mode']}: {failure}"
+        for item in mode_payloads
+        for failure in item["failures"]
+    ]
+    mode_records = [
+        {
+            key: item[key]
+            for key in (
+                "mode",
+                "settings",
+                "sha256",
+                "actual_settings",
+                "viewport",
+                "xhtml_count",
+                "formula_count",
+                "xhtml_link_count",
+                "fragment_link_count",
+                "noteref_target_checks",
+                "backlink_target_checks",
+                "noteref_navigation_checks",
+                "backlink_navigation_checks",
+                "failures",
+                "events",
+            )
+        }
+        for item in mode_payloads
+    ]
+    payload: dict[str, Any] = {
+        "epub": str(epub.resolve()),
+        "sha256": digest,
+        "mode": mode,
+        "namespace": namespace,
+        "mode_count": len(mode_payloads),
+        "xhtml_count": len(members),
+        "total_xhtml_checks": len(members) * len(mode_payloads),
+        "failures": failures,
+        "modes": mode_records,
+        "sessions": [item["events"]["session"] for item in mode_payloads],
+    }
+    write_json(evidence / "results.json", payload)
+    summary: list[str] = [
+        f"epub={epub.resolve()}",
+        f"sha256={digest}",
+        f"mode={mode}",
+        f"mode_count={len(mode_payloads)}",
+        f"xhtml_count_per_mode={len(members)}",
+        f"total_xhtml_checks={payload['total_xhtml_checks']}",
+        f"failures={len(failures)}",
+    ]
+    for item in mode_payloads:
+        summary.extend(mode_summary(item))
+    (evidence / "summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     if failures:
+        (evidence / "error.txt").write_text(
+            "浏览器验收失败：\n" + "\n".join(failures) + "\n", encoding="utf-8"
+        )
         raise BrowserQAError("浏览器验收失败：\n" + "\n".join(failures))
     return payload
 
@@ -679,6 +1073,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--page-timeout", type=int, default=30)
     parser.add_argument("--screenshots", type=int, default=6)
+    parser.add_argument(
+        "--mode",
+        choices=(ALL_MODES, *DEFAULT_MODE_NAMES),
+        default=ALL_MODES,
+        help="默认执行完整读者矩阵；选择单模式仅用于诊断",
+    )
     args = parser.parse_args(argv)
     try:
         payload = run_browser_qa(
@@ -689,13 +1089,16 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             page_timeout=args.page_timeout,
             screenshots=args.screenshots,
+            mode=args.mode,
         )
     except BrowserQAError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
+    formula_count = sum(item["formula_count"] for item in payload["modes"])
     print(
-        f"browser-qa: xhtml={payload['xhtml_count']} "
-        f"formulas={payload['formula_count']} sha256={payload['sha256']}"
+        f"browser-qa: modes={payload['mode_count']} "
+        f"xhtml_per_mode={payload['xhtml_count']} "
+        f"formulas={formula_count} sha256={payload['sha256']}"
     )
     return 0
 

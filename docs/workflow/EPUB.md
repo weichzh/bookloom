@@ -181,7 +181,7 @@ EPUB 3 Navigation Document 是唯一当前导航事实源：
 
 检查不能只截图：还要用 DOM 断言确认资源加载、导航目标、脚注跳转、视口宽度和横向溢出。脚注对全部引用、目标和返回链接做 DOM 闭合检查；实际点击按每个 XHTML 的首项、中项和末项抽样，避免 Chromium 在同一文档连续百次导航后限流并制造假失败。结果分别记录全量目标检查数和实际点击数。溢出失败证据至少记录 offending selector、元素边界、`clientWidth`、`scrollWidth` 和短文本，避免另开一次不可复现的 DOM 诊断。通用验收以浏览器实际执行包内 XHTML、CSS 和 SVG 为准；只有 Kindle、多看或其他渠道专版依赖私有行为时，才追加对应真实阅读器检查。
 
-一个壳页面在同一 iframe 内串行加载全部 XHTML，保存 `run.json`、`progress.json`、`results.json`、摘要和代表页截图。运行使用项目稳定 namespace 和单次唯一 session，只关闭自己的 session；禁止 `close --all`、按进程名终止或清理其他项目。诊断参数和当前默认值以 `browser-qa --help` 为准。
+正式 runner 默认逐一执行三种读者模式：窄屏默认、1280×900 深色配色、390×844 关闭出版社样式并覆盖 serif 字体与 32px 字号。每模式用壳页面在同一 iframe 内串行加载全部 XHTML，保存 `run.json`、`progress.json`、`results.json`、摘要和代表页截图；总结果记录每模式设置、检查数、失败与共同 EPUB 哈希。运行使用项目稳定 namespace 和单次唯一 session，只关闭自己的 session；禁止 `close --all`、按进程名终止或清理其他项目。诊断参数和当前默认值以 `browser-qa --help` 为准。
 
 Windows 上首次命令启动持久 daemon 时，stdout/stderr 管道可能被 daemon 继承而阻塞调用方；项目入口因此不捕获首次启动命令，后续结构化命令才捕获输出。验收壳必须等顶层 `load` 后再开始 iframe 扫描，避免把全书扫描算进单次 `open` 的 30 秒 IPC 等待。`set viewport` 的已知 EOF 只有在随后读取的实际尺寸正确时才可记录为兼容事件。PATH 外的完整 npm 安装通过 `TRANSLATOR_AGENT_BROWSER` 指向原生可执行文件；不得为此硬编码用户目录。
 
@@ -201,6 +201,8 @@ EPUBCheck 证明规范结构，不证明浏览器正确显示；浏览器检查�
 6. `final.json` 对应最终候选哈希，`STATUS.md` 记录人工结论、证据等级和未覆盖项。
 7. 交付副本与正式输出哈希一致。
 8. 临时解包、样本和截图已清理；被忽略的书籍级公式增量缓存可以保留。
+
+final、completion 和交付回执保存在 `.local/translator/evidence/<work-key>/`，只含路径、大小、哈希、模式和检查统计；不保存正文、截图或完整 DOM 诊断。`clean` 删除临时大文件后仍能复核终态和交付，重建仍失效旧 final；它不能恢复此前已删失的历史证据。
 
 对历史缺陷建立正向恢复账本时，定位键应组合来源页、规范内容和邻近语义锚点；当前文件行号或 AST 序号只能作辅助。非内容结构调整后必须重绑并复核歧义项，不能因候选数量相等就宣称恢复完成。
 

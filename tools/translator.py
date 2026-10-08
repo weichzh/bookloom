@@ -30,8 +30,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from tools import page_boundary_audit
+    from tools import epub_browser_qa, epub_source, page_boundary_audit
 except ModuleNotFoundError:  # direct ``python tools/translator.py`` execution
+    import epub_browser_qa
+    import epub_source
     import page_boundary_audit
 
 
@@ -182,6 +184,8 @@ WORK_COMMANDS = frozenset(
         "complete",
         "clean",
         "prepare",
+        "scratch",
+        "source-draft",
     }
 )
 ACTIVITIES = (
@@ -379,6 +383,8 @@ def run(
     process_temp = str(temp_root())
     process_env["TEMP"] = process_temp
     process_env["TMP"] = process_temp
+    # Tool-only uv dependencies must not rewrite the repository lockfile.
+    process_env["UV_FROZEN"] = "true"
     try:
         result = subprocess.run(
             command,
@@ -689,25 +695,28 @@ def status_document_state(path: Path) -> str | None:
     except OSError as error:
         raise CliError(f"无法读取 STATUS.md：{error}") from error
     for line in lines:
-        match = re.search(r"(?:^|\s)(?:状态|status)\s*[:：=]\s*(.+)$", line, re.IGNORECASE)
+        match = re.search(
+            r"(?:^|\s)(?:状态|status)\s*[:：=]\s*(.+)$", line, re.IGNORECASE
+        )
         if not match:
             continue
-        value = match.group(1).casefold()
-        if any(
-            marker in value
-            for marker in (
+        value = match.group(1).casefold().lstrip("`* ")
+        aliases = {
+            "planned": ("planned", "计划", "待开始", "已初始化"),
+            "active": (
+                "active",
+                "进行中",
+                "处理中",
+                "阻塞",
+                "blocked",
                 "未完成",
                 "不完整",
                 "未验收",
                 "incomplete",
                 "not complete",
                 "not accepted",
-            )
-        ):
-            return "active"
-        if any(
-            marker in value
-            for marker in (
+            ),
+            "complete": (
                 "complete",
                 "full-local-accepted",
                 "local-accepted",
@@ -716,18 +725,17 @@ def status_document_state(path: Path) -> str | None:
                 "已验收",
                 "已交付",
                 "验收",
-            )
-        ):
-            return "complete"
-        if any(
-            marker in value
-            for marker in ("active", "进行中", "处理中", "阻塞", "blocked", "未完成")
-        ):
-            return "active"
-        if any(marker in value for marker in ("planned", "计划", "待开始")):
-            return "planned"
+            ),
+        }
+        for state, markers in aliases.items():
+            if any(
+                re.match(re.escape(marker) + r"(?=$|[\s`*;；,，。.(（])", value)
+                for marker in markers
+            ):
+                return state
+        # An unknown declaration must not inherit a state from its explanation.
+        return None
     return None
-
 
 def validate_manifest_status_alignment(work: Work) -> None:
     work_path = getattr(work, "path", None)
@@ -1035,7 +1043,7 @@ def compress_page_spec(pages: list[int]) -> str:
     return ",".join(ranges)
 
 
-def epub_page_anchors(path: Path) -> tuple[list[int], str]:
+def epub_page_anchors(path: Path, *, allow_missing: bool = False) -> tuple[list[int], str]:
     if not zipfile.is_zipfile(path):
         raise CliError(f"EPUB 来源不是有效 ZIP：{path}")
     try:
@@ -1098,7 +1106,7 @@ def epub_page_anchors(path: Path) -> tuple[list[int], str]:
                     seen.add(page)
                     pages.append(page)
             pages.sort()
-            if not pages:
+            if not pages and not allow_missing:
                 raise CliError(f"EPUB 来源正文没有 Page_N 页面锚点：{path}")
             return pages, f"opf={opf_path};content_files={len(content_paths)}"
     except zipfile.BadZipFile as error:
@@ -2700,7 +2708,10 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def temp_root(root: Path = REPO_ROOT) -> Path:
-    target = (root.resolve() / ".tmp" / "translator").resolve()
+    expected = root.resolve() / ".tmp" / "translator"
+    target = expected.resolve()
+    if target != expected:
+        raise CliError(f"拒绝使用重定向的临时根目录：{target}")
     target.mkdir(parents=True, exist_ok=True)
     return target
 
@@ -3263,17 +3274,103 @@ def workflow_step(
 def work_temp(work: Work) -> Path:
     base = temp_root(work.root)
     key = hashlib.sha256(path_key(work.path).encode("utf-8")).hexdigest()[:16]
-    target = (base / key).resolve(strict=False)
-    if target.parent != base:
-        raise CliError(f"拒绝使用不安全的临时目录：{target}")
+    return owned_child(base, key, "临时目录")
+
+
+def owned_child(base: Path, name: str, label: str) -> Path:
+    """Reject aliases, including aliases to siblings within the allowed root."""
+    expected = base / name
+    if expected.parent != base or expected.is_symlink() or expected.is_junction():
+        raise CliError(f"拒绝使用不安全的{label}：{expected}")
+    try:
+        target = expected.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise CliError(f"无法解析{label}：{expected}") from error
+    if target != expected:
+        raise CliError(f"拒绝使用重定向的{label}：{expected}")
     return target
 
 
+def work_receipts(work: Work) -> Path:
+    expected = work.root.resolve() / ".local" / "translator" / "evidence"
+    base = expected.resolve(strict=False)
+    if base != expected:
+        raise CliError(f"拒绝使用重定向的回执目录：{base}")
+    key = hashlib.sha256(path_key(work.path).encode("utf-8")).hexdigest()[:16]
+    return owned_child(base, key, "回执目录")
+
+
+def evidence_dir(work: Work, name: str) -> Path:
+    base = (
+        work_receipts(work)
+        if name in {"final", "completion", "delivery"}
+        else work_temp(work)
+    )
+    return owned_child(base, name, "证据目录")
+
+
+def scratch_dir(work: Work, name: str) -> Path:
+    if (
+        not ID_RE.fullmatch(name)
+        or name.endswith(".")
+        or re.fullmatch(
+            r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", name, re.IGNORECASE
+        )
+    ):
+        raise CliError("--agent 必须是安全的小写目录名")
+    base = evidence_dir(work, "scratch")
+    target = owned_child(base, name, "scratch 目录")
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def command_scratch(args: argparse.Namespace) -> int:
+    work = load_command_work(args)
+    target = scratch_dir(work, args.agent)
+    print(
+        json.dumps(
+            {
+                "path": str(target),
+                "work_id": work.work_id,
+                "source_sha256": sha256(work.source),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def command_source_draft(args: argparse.Namespace) -> int:
+    work = load_command_work(args)
+    if work.source.suffix.lower() != ".epub":
+        raise CliError("source-draft 只支持 EPUB 原生来源")
+    if sha256(work.source) != str(work.manifest["source"]["sha256"]).upper():
+        raise CliError("EPUB 来源哈希与 manifest 不一致")
+    scratch = scratch_dir(work, args.agent)
+    try:
+        package, drafts = epub_source.render_epub(work.source)
+        paths, mapping = epub_source.write_drafts(
+            package,
+            drafts,
+            scratch / f"source-draft-{workflow_run_id()}",
+            scratch_root=scratch,
+        )
+    except epub_source.EpubSourceError as error:
+        raise CliError(str(error)) from error
+    print(
+        json.dumps(
+            {
+                "drafts": [str(path) for path in paths],
+                "source_map": str(mapping),
+                "verified": False,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
 def reset_evidence_dir(work: Work, name: str) -> Path:
-    base = work_temp(work)
-    target = (base / name).resolve(strict=False)
-    if target.parent != base.resolve(strict=False):
-        raise CliError(f"拒绝清理不安全的临时目录：{target}")
+    target = evidence_dir(work, name)
     if target.exists():
         shutil.rmtree(target)
     target.mkdir(parents=True)
@@ -3281,10 +3378,7 @@ def reset_evidence_dir(work: Work, name: str) -> Path:
 
 
 def clear_evidence_dir(work: Work, name: str) -> None:
-    base = work_temp(work)
-    target = (base / name).resolve(strict=False)
-    if target.parent != base.resolve(strict=False):
-        raise CliError(f"拒绝清理不安全的临时目录：{target}")
+    target = evidence_dir(work, name)
     if target.exists():
         shutil.rmtree(target)
 
@@ -3292,11 +3386,9 @@ def clear_evidence_dir(work: Work, name: str) -> None:
 def reset_evidence_child(
     work: Work, name: str, child: str, *, create: bool = True
 ) -> Path:
-    root = (work_temp(work) / name).resolve(strict=False)
+    root = evidence_dir(work, name)
     root.mkdir(parents=True, exist_ok=True)
-    target = (root / child).resolve(strict=False)
-    if target.parent != root:
-        raise CliError(f"拒绝清理不安全的临时目录：{target}")
+    target = owned_child(root, child, "临时目录")
     if target.exists():
         shutil.rmtree(target)
     if create:
@@ -5604,13 +5696,17 @@ def write_finalize_summary(
     evidence_root = work_temp(work)
     outputs = []
     for language, target, output in jobs:
-        qa_evidence = evidence_root / "qa" / re.sub(
-            r"[^A-Za-z0-9._-]", "_", f"{language.code}-{target}"
+        qa_evidence = inside(
+            evidence_root,
+            "qa/" + re.sub(r"[^A-Za-z0-9._-]", "_", f"{language.code}-{target}"),
+            "QA evidence",
         )
         browser_evidence = (
-            evidence_root
-            / "browser-qa"
-            / re.sub(r"[^A-Za-z0-9._-]", "_", language.code)
+            inside(
+                evidence_root,
+                "browser-qa/" + re.sub(r"[^A-Za-z0-9._-]", "_", language.code),
+                "browser evidence",
+            )
             if target == "epub"
             else None
         )
@@ -5618,6 +5714,12 @@ def write_finalize_summary(
             raise CliError(f"finalize 缺少输出或 QA 证据：{language.code}/{target}")
         if browser_evidence is not None and not browser_evidence.is_dir():
             raise CliError(f"finalize 缺少浏览器证据：{language.code}/{target}")
+        qa_receipt = evidence_digest(qa_evidence)
+        browser_receipt = (
+            browser_acceptance_receipt(browser_evidence, output)
+            if browser_evidence is not None
+            else None
+        )
         outputs.append(
             {
                 "language": language.code,
@@ -5631,38 +5733,112 @@ def write_finalize_summary(
                     if browser_evidence is not None
                     else None
                 ),
+                "qa_receipt": qa_receipt,
+                "browser_qa_receipt": browser_receipt,
             }
         )
 
     manifest = work.path / "manifest.toml"
     summary = final_dir / "final.json"
-    summary.write_text(
-        json.dumps(
-            {
-                "work_id": work.work_id,
-                "work": str(work.path.resolve()),
-                "source": {
-                    "path": str(work.source.resolve()),
-                    "sha256": sha256(work.source),
-                },
-                "manifest": {
-                    "path": str(manifest.resolve()),
-                    "sha256": sha256(manifest),
-                    "build_sha256": manifest_build_sha256(manifest),
-                },
-                "outputs": outputs,
+    publish_json_atomic(
+        summary,
+        {
+            "schema_version": 2,
+            "work_id": work.work_id,
+            "work": str(work.path.resolve()),
+            "source": {
+                "path": str(work.source.resolve()),
+                "sha256": sha256(work.source),
             },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+            "manifest": {
+                "path": str(manifest.resolve()),
+                "sha256": sha256(manifest),
+                "build_sha256": manifest_build_sha256(manifest),
+            },
+            "outputs": outputs,
+        },
     )
     return summary
 
 
+def evidence_digest(directory: Path) -> dict[str, Any]:
+    """Keep a content-free digest after disposable diagnostics are removed."""
+    records = []
+    for path in sorted(directory.rglob("*")):
+        resolved = path.resolve()
+        if not resolved.is_relative_to(directory.resolve()):
+            raise CliError(f"验收证据越出允许目录：{path}")
+        if path.is_file():
+            records.append(
+                (
+                    path.relative_to(directory).as_posix(),
+                    path.stat().st_size,
+                    sha256(path),
+                )
+            )
+    if not records:
+        raise CliError(f"finalize 验收证据为空：{directory}")
+    digest = (
+        hashlib.sha256(json.dumps(records, ensure_ascii=False).encode("utf-8"))
+        .hexdigest()
+        .upper()
+    )
+    return {"status": "passed", "file_count": len(records), "sha256": digest}
+
+
+def browser_acceptance_receipt(directory: Path, output: Path) -> dict[str, Any]:
+    path = owned_child(directory.resolve(), "results.json", "browser results")
+    if not path.is_file():
+        raise CliError(f"缺少 browser results：{path}")
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise CliError(f"浏览器验收结果无效：{path}") from error
+    digest = sha256(output)
+    names = set(epub_browser_qa.DEFAULT_MODE_NAMES)
+    modes = result.get("modes", []) if isinstance(result, dict) else []
+    if (
+        not isinstance(modes, list)
+        or len(modes) != 3
+        or any(not isinstance(mode, dict) for mode in modes)
+        or {mode.get("mode") for mode in modes} != names
+        or result.get("mode_count") != 3
+        or result.get("failures") != []
+        or str(result.get("sha256")).upper() != digest
+    ):
+        raise CliError("finalize 要求同一成品哈希的完整浏览器模式矩阵")
+    compact = []
+    expected_settings = {mode["name"]: mode for mode in epub_browser_qa.default_modes()}
+    count_keys = (
+        "xhtml_count",
+        "formula_count",
+        "xhtml_link_count",
+        "fragment_link_count",
+        "noteref_target_checks",
+        "backlink_target_checks",
+        "noteref_navigation_checks",
+        "backlink_navigation_checks",
+    )
+    for mode in modes:
+        if (
+            str(mode.get("sha256")).upper() != digest
+            or mode.get("failures") != []
+            or not isinstance(mode.get("xhtml_count"), int)
+            or mode["xhtml_count"] < 1
+            or mode["xhtml_count"] != result.get("xhtml_count")
+            or mode.get("settings") != expected_settings[mode["mode"]]
+            or mode.get("viewport") != expected_settings[mode["mode"]]["viewport"]
+            or any(
+                type(mode.get(key)) is not int or mode[key] < 0 for key in count_keys
+            )
+        ):
+            raise CliError("浏览器模式结果未完整通过或哈希不一致")
+        keys = ("mode", "settings", "viewport", "sha256", *count_keys)
+        compact.append({key: mode.get(key) for key in keys})
+    return {"status": "passed", "results_sha256": sha256(path), "modes": compact}
+
 def load_current_final_summary(work: Work) -> tuple[Path, dict[str, Any]]:
-    path = work_temp(work) / "final" / "final.json"
+    path = owned_child(evidence_dir(work, "final"), "final.json", "final receipt")
     if not path.is_file():
         raise CliError("缺少当前 finalize 证据；请先运行 finalize")
     try:
@@ -5786,11 +5962,8 @@ def command_deliver(args: argparse.Namespace) -> int:
             f"交付目标扩展名必须为 {output.suffix.lower()}：{destination}"
         )
 
-    delivery_dir = (
-        work_temp(work)
-        / "delivery"
-        / delivery_evidence_key(language.code, target)
-    )
+    delivery_base = evidence_dir(work, "delivery")
+    delivery_dir = owned_child(delivery_base, delivery_evidence_key(language.code, target), "交付回执目录")
     delivery_dir.mkdir(parents=True, exist_ok=True)
     evidence = delivery_dir / "delivery.json"
     attempt = delivery_dir / "attempt.json"
@@ -5939,7 +6112,7 @@ def command_complete(args: argparse.Namespace) -> int:
                     completed_summary,
                 )
 
-            evidence = work_temp(work) / "completion" / "completion.json"
+            evidence = evidence_dir(work, "completion") / "completion.json"
             publish_json_atomic(
                 evidence,
                 {
@@ -6522,6 +6695,7 @@ def manifest_text(
     source_language: str,
     target_languages: list[str],
     targets: tuple[str, ...],
+    source_units: bool = False,
 ) -> str:
     extension = {"typst": "typ", "markdown": "md", "html": "html", "latex": "tex"}[
         format_name
@@ -6539,7 +6713,9 @@ def manifest_text(
         f"relative_path = {quote_toml(source.relative_to(root).as_posix())}",
         f"sha256 = {quote_toml(digest)}",
     ]
-    if anchor_pages is None:
+    if source_units:
+        lines.extend(['format = "epub"', 'units = "source-units.tsv"', f"file_size_bytes = {source.stat().st_size}"])
+    elif anchor_pages is None:
         lines.extend(
             [
                 "",
@@ -6621,12 +6797,23 @@ def command_init(args: argparse.Namespace) -> int:
     work_path = resolve_work_path(work_value, root)
     if work_path.exists():
         raise CliError(f"工作目录已存在，不会覆盖：{work_path}")
+    unit_rows = ()
     if source.suffix.lower() == ".pdf":
         pages, _ = mutool_pages(source)
         anchor_pages = None
     else:
-        anchor_pages, _ = epub_page_anchors(source)
-        pages = max(anchor_pages)
+        try:
+            unit_rows = epub_source.read_source_units(source)
+        except epub_source.EpubSourceError as error:
+            raise CliError(str(error)) from error
+        anchor_pages, _ = epub_page_anchors(source, allow_missing=True)
+        if anchor_pages:
+            pages = max(anchor_pages)
+            unit_rows = ()
+        else:
+            pages = len(unit_rows)
+            if args.format not in {"markdown", "html"}:
+                raise CliError("没有固定页码的 EPUB 请使用 --format markdown 或 html；当前格式不支持 source-unit")
     digest = sha256(source)
     content = manifest_text(
         work_id=args.id,
@@ -6640,6 +6827,7 @@ def command_init(args: argparse.Namespace) -> int:
         source_language=source_language,
         target_languages=target_languages,
         targets=targets,
+        source_units=bool(unit_rows),
     )
     extension = {"typst": "typ", "markdown": "md", "html": "html", "latex": "tex"}[
         args.format
@@ -6650,16 +6838,22 @@ def command_init(args: argparse.Namespace) -> int:
         (work_path / "output").mkdir()
         (work_path / "manifest.toml").write_text(content, encoding="utf-8")
         (work_path / "STATUS.md").write_text(
-            f"# 《{args.title}》工作状态\n\n状态：已初始化，尚未开始逐页视觉核对。\n",
+            f"# 《{args.title}》工作状态\n\n状态：planned\n\n已初始化，尚未开始来源视觉核对。\n",
             encoding="utf-8",
         )
-        with (work_path / "page-map.tsv").open(
+        mapping_name = "source-units.tsv" if unit_rows else "page-map.tsv"
+        with (work_path / mapping_name).open(
             "w", encoding="utf-8", newline=""
         ) as handle:
             writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
-            writer.writerow(PAGE_MAP_HEADER)
-            for page in range(1, pages + 1):
-                writer.writerow((page, "", "", "", "", ""))
+            if unit_rows:
+                writer.writerow(SOURCE_UNITS_HEADER)
+                for row in unit_rows:
+                    writer.writerow(tuple(row[key] for key in SOURCE_UNITS_HEADER))
+            else:
+                writer.writerow(PAGE_MAP_HEADER)
+                for page in range(1, pages + 1):
+                    writer.writerow((page, "", "", "", "", ""))
         for index, language in enumerate([source_language, *target_languages]):
             language_dir = work_path / language
             language_dir.mkdir()
@@ -6863,7 +7057,19 @@ def parser() -> argparse.ArgumentParser:
     add_station_arguments(complete)
     complete.set_defaults(handler=command_complete)
 
-    clean = commands.add_parser("clean", help="清理该书临时证据")
+    scratch = commands.add_parser("scratch", help="创建作品内隔离的 Agent 临时目录")
+    scratch.add_argument("work")
+    scratch.add_argument("--agent", required=True)
+    add_station_arguments(scratch)
+    scratch.set_defaults(handler=command_scratch)
+
+    source_draft = commands.add_parser("source-draft", help="在 scratch 生成原生 EPUB 语义草稿和来源映射，仍需视觉核定")
+    source_draft.add_argument("work")
+    source_draft.add_argument("--agent", required=True)
+    add_station_arguments(source_draft)
+    source_draft.set_defaults(handler=command_source_draft)
+
+    clean = commands.add_parser("clean", help="清理该书临时证据，保留终态和交付回执")
     clean.add_argument("work")
     add_station_arguments(clean)
     clean.set_defaults(handler=command_clean)

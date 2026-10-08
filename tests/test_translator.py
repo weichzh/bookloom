@@ -529,16 +529,26 @@ class TranslatorTests(unittest.TestCase):
             def qa(_args: object) -> int:
                 order.append("qa")
                 for target in outputs:
-                    (translator.work_temp(work) / "qa" / f"zh-CN-{target}").mkdir(
-                        parents=True
-                    )
+                    qa_dir = translator.work_temp(work) / "qa" / f"zh-CN-{target}"
+                    qa_dir.mkdir(parents=True)
+                    (qa_dir / "summary.txt").write_text("passed\n", encoding="utf-8")
                 return 0
 
             def browser(_args: object) -> int:
                 order.append("browser-qa")
-                (translator.work_temp(work) / "browser-qa" / "zh-CN").mkdir(
-                    parents=True
-                )
+                browser_dir = translator.work_temp(work) / "browser-qa" / "zh-CN"
+                browser_dir.mkdir(parents=True)
+                (browser_dir / "summary.txt").write_text("passed\n", encoding="utf-8")
+                digest = translator.sha256(outputs["epub"])
+                (browser_dir / "results.json").write_text(json.dumps({
+                    "sha256": digest, "failures": [], "mode_count": 3, "xhtml_count": 1,
+                    "modes": [{"mode": mode["name"], "settings": mode, "viewport": mode["viewport"],
+                               "sha256": digest, "failures": [], "xhtml_count": 1,
+                               "formula_count": 0, "xhtml_link_count": 0, "fragment_link_count": 0,
+                               "noteref_target_checks": 0, "backlink_target_checks": 0,
+                               "noteref_navigation_checks": 0, "backlink_navigation_checks": 0}
+                              for mode in translator.epub_browser_qa.default_modes()],
+                }), encoding="utf-8")
                 return 0
 
             finalize_args = types.SimpleNamespace(work=work_path)
@@ -577,7 +587,7 @@ class TranslatorTests(unittest.TestCase):
                 )
             )
             final = json.loads(
-                (translator.work_temp(work) / "final" / "final.json").read_text(
+                (translator.evidence_dir(work, "final") / "final.json").read_text(
                     encoding="utf-8"
                 )
             )
@@ -729,7 +739,7 @@ class TranslatorTests(unittest.TestCase):
                 encoding="utf-8",
             )
             sibling_receipt = (
-                translator.work_temp(work)
+                translator.work_receipts(work)
                 / "delivery"
                 / "zh-CN-pdf"
                 / "delivery.json"
@@ -748,7 +758,7 @@ class TranslatorTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"final epub")
             evidence = json.loads(
                 (
-                    translator.work_temp(work)
+                    translator.work_receipts(work)
                     / "delivery"
                     / "zh-CN-epub"
                     / "delivery.json"
@@ -759,7 +769,7 @@ class TranslatorTests(unittest.TestCase):
             self.assertEqual(evidence["output"]["destination"], str(destination))
             self.assertFalse(
                 (
-                    translator.work_temp(work)
+                    translator.work_receipts(work)
                     / "delivery"
                     / "zh-CN-epub"
                     / "attempt.json"
@@ -828,7 +838,7 @@ class TranslatorTests(unittest.TestCase):
                 encoding="utf-8",
             )
             receipt = (
-                translator.work_temp(work)
+                translator.work_receipts(work)
                 / "delivery"
                 / "zh-CN-epub"
                 / "delivery.json"
@@ -1085,7 +1095,7 @@ class TranslatorTests(unittest.TestCase):
             translator.load_current_final_summary(work)
             completion = json.loads(
                 (
-                    translator.work_temp(work) / "completion" / "completion.json"
+                    translator.evidence_dir(work, "completion") / "completion.json"
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(completion["manifest"]["after_sha256"], translator.sha256(manifest))
@@ -1223,7 +1233,7 @@ class TranslatorTests(unittest.TestCase):
             self.assertEqual(manifest.read_text(encoding="utf-8"), active_manifest)
             self.assertFalse(
                 (
-                    translator.work_temp(work) / "completion" / "completion.json"
+                    translator.evidence_dir(work, "completion") / "completion.json"
                 ).exists()
             )
 
@@ -2324,6 +2334,7 @@ class TranslatorTests(unittest.TestCase):
             (ROOT / ".tmp" / "translator").resolve(),
         )
         self.assertEqual(process_env["TEMP"], process_env["TMP"])
+        self.assertEqual(process_env["UV_FROZEN"], "true")
 
     def test_work_temp_and_clean_are_isolated_by_work_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

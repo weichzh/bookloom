@@ -57,7 +57,7 @@ outputs = { pdf = "output/example-book.zh.pdf" }
 ## 流程 CLI
 
 - `uv run python tools/translator.py prepare WORK --activity ...` 对中文 Markdown 入口依次运行 AutoCorrect 修复、lint 和 `check`；随后只能使用目标级 `refresh` 或一次性 `finalize`。
-- `check` 会在存在可识别状态声明时比较 manifest 与 `STATUS.md`；两者不一致必须先修正，不能继续构建。LaTeX 作品声明 EPUB 输出时，`check` 还会复用正式展开、规范化和 Pandoc/Lua 过滤链做快速预检，但不生成公式或写正式输出。
+- `check` 会在存在可识别状态声明时比较 manifest 与 `STATUS.md`；状态只解析冒号后的第一个明确值，不从后续说明中的“完成／验收”推断。状态未知时不推断完成；两者不一致必须先修正，不能继续构建。LaTeX 作品声明 EPUB 输出时，`check` 还会复用正式展开、规范化和 Pandoc/Lua 过滤链做快速预检，但不生成公式或写正式输出。
 - 同一作品／会话的工站 lane 由 CLI 互斥；锁文件只在 `.local/translator/state/`，由进程退出自动释放。
 - PDF 来源页数、来源页渲染和 QA 统一以 `mutool` 为入口，不依赖 `pdftoppm.cmd` 包装器。
 - `doctor --for all` 还扫描 `README.md`、`AGENTS.md`、`CONTEXT.md` 和 `docs/**/*.md` 中的本地 Python 入口；不存在或不唯一的路径属于文档入口漂移，必须先修复。
@@ -125,7 +125,9 @@ kind	source	target	note
 
 精确参数、选项和默认值只由 `tools/translator.py --help` 及对应子命令 `--help` 定义。当前稳定语义是：
 
-- `init` 只创建不存在的单书工作目录和初始契约文件，不覆盖已有工作。
+- `init` 只创建不存在的单书工作目录和初始契约文件，不覆盖已有工作。EPUB 无 `Page_N` 时按 OPF spine 初始化 `source-units.tsv`，不伪造页码；此路径使用 Markdown 或 HTML。损坏包、重复锚点或非法 spine 阻断，不用 fallback 掩盖。
+- `scratch WORK --agent NAME` 输出 JSON 路径和来源哈希，创建安全命名的作品临时分片；不清理已有文件。
+- `source-draft WORK --agent NAME` 在 scratch 的每次独立运行目录生成原生 XHTML 的 Markdown 草稿和来源映射；不覆盖旧草稿，复验不需先删除分片。使用正式 reader flags，保留原生语义并报告不支持或歧义，不写正式底稿、进度或译文。草稿仍需逐单元视觉核定。
 - `station [WORK]` 是不运行书籍检查或构建的工站边界；没有具体作品的文档、代码和协调活动使用默认 `project` lane。
 - `doctor` 只探测所选用途实际需要的工具；`--for all` 另外执行权威文档入口漂移检查。
 - `render` 把指定来源页渲染到该书隔离的临时证据目录。
@@ -133,16 +135,16 @@ kind	source	target	note
 - `boundary-audit` 只读解析底稿中的源页标记，生成跨页连续性候选的 `report.json`、`review.tsv` 和 `summary.txt`；`--pages` 可缩小复核页对，候选不会阻断 `check` 或构建。
 - `build` 只构建 manifest 声明且被选择的输出；每个文件原子替换，失败保留未被替换的旧文件。直接构建会先失效旧 `refresh`／`final` 摘要，防止摘要继续绑定已变化的输出。
 - `qa` 重建所选输出的自动 QA 证据，保留未选择目标的证据；全量选择时先清空整组证据。EPUB 额外写出 `outline.txt`，逐行保存 toc 深度、可见标题和 href。
-- `browser-qa` 只对所选正式 EPUB 执行隔离浏览器验收，保留未选择语言的证据且不清理其他 session。
+- `browser-qa` 只对所选正式 EPUB 执行隔离浏览器验收，默认运行窄屏、宽屏读者深色配色、窄屏关闭出版社样式并覆盖用户字体与 200% 字号三种模式。每模式执行全部 XHTML、资源、链接和脚注往返；结果绑定同一成品哈希，保留未选择语言的证据且不清理其他 session。
 - `compare-epub OFFICIAL CANDIDATE` 排除两端已知的 `META-INF/calibre_bookmarks.txt` 及共享写出器生成的 OPF 构建时间后逐成员比较两个 EPUB；其余成员集合和内容全部相同时返回 0。它单独报告阅读器书签、易变构建时间和真实成员差异，但不复制或覆盖文件。
 - `benchmark` 只聚合本机历史流程日志，不运行或修改书籍任务；可按作品目录名或 `work.id` 过滤。
 - `refresh WORK --lang LANG --target TARGET` 固定运行 `check → build → qa`，EPUB 再运行 `browser-qa`，并写目标级 `refresh.json`。入口失效旧 refresh 摘要，通过 check 后再失效旧 final 摘要；语言和目标必须显式选择。它是迭代证据，不是全书完成证明。
-- `finalize WORK` 先失效旧 refresh/final 摘要，再对全部 manifest 输出固定执行 `doctor → check → build → qa`，存在 EPUB 时运行 `browser-qa`；首个失败立即停止且不保留成功摘要。成功后写 `.tmp/translator/<work-key>/final/final.json`，绑定来源、manifest、正式输出的路径、大小和 SHA-256 以及对应证据目录。它只证明机械链通过，不代表人工内容或视觉验收完成。
+- `finalize WORK` 先失效旧 refresh/final 摘要，再对全部 manifest 输出固定执行 `doctor → check → build → qa`，存在 EPUB 时运行 `browser-qa`；首个失败立即停止且不保留成功摘要。成功后写 `.local/translator/evidence/<work-key>/final/final.json`，绑定来源、manifest、正式输出的路径、大小和 SHA-256，以及对应临时证据目录与无正文验收摘要。它只证明机械链通过，不代表人工内容或视觉验收完成。
 - `complete WORK` 只在 manifest 为 `active`、`STATUS.md` 已明确本地完成、当前 `final.json` 有效且其中全部正式输出未变化时，把 manifest 原子迁为 `complete` 并写 `completion.json`；它不编辑 STATUS，也不推断人工内容。迁移保持 manifest 原换行与注释，写入后再次核验全部输出；发现竞态时只在 manifest 仍为本次写入值时精确回滚。`final.json` 同时保存忽略 `work.status` 的构建配置摘要，因此仅此状态迁移不会让成品证据失效，其他 manifest 变化仍会阻断。
 - `deliver WORK --lang LANG --target TARGET --to FILE` 只允许 manifest 与 `STATUS.md` 都已完成的作品、唯一正式输出和明确目标文件。它要求来源、manifest 构建配置、输出路径、大小和 SHA-256 与当前 `final.json` 一致；先在该语言／目标的独立证据目录原子写 `attempt.json`，再复制到目标目录内的 staging 文件，核验后才原子替换目标，最后再次复核并原子更新 `delivery.json`。失败尝试不删除同目标旧成功回执；未运行 `complete`、缺少或过期 finalize 证据时不会触碰目标文件，交付另一输出也不会删除已有回执。
-- `clean` 只删除该书由已解析绝对路径哈希确定的 `.tmp/translator/` 目录，保留正式底稿、输出、`.cache/svg-math/` 和本机流程日志。
+- `clean` 只删除该书由已解析绝对路径哈希确定的 `.tmp/translator/` 目录，保留正式底稿、输出、`.cache/svg-math/`、本机流程日志和 `.local/translator/evidence/` 中的 final／completion／delivery／attempt 回执。清理后仍可交付，来源、构建配置或成品变化仍阻断；旧版已被清理的回执不会凭空恢复，需重新 finalize。
 
-所有临时安全键使用已解析工作目录绝对路径的 SHA-256，不信任 `work.id`；清理前必须再次验证 containment。CLI 子进程统一继承仓库临时根作为 `TEMP` 和 `TMP`。
+所有临时安全键使用已解析工作目录绝对路径的 SHA-256，不信任 `work.id`；清理前必须验证路径身份与 containment，同根内指向兄弟目录的 symlink／junction 也拒绝。CLI 子进程统一继承仓库临时根作为 `TEMP` 和 `TMP`；嵌套 uv 使用 frozen 模式，工具临时依赖不得重写项目锁文件。启动统一入口建议使用 `uv run --locked python tools/translator.py`。
 
 ## 流程日志与 benchmark
 
