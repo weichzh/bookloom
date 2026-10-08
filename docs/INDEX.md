@@ -19,4 +19,3 @@
 | [docs/codebase/CONTRACTS.md](codebase/CONTRACTS.md) | manifest、CLI 与日志机器语义 | book, shared-change |
 | [docs/workflow/TRANSLATION.md](workflow/TRANSLATION.md) | 内容恢复、翻译与交付流程 | book |
 | [docs/workflow/EPUB.md](workflow/EPUB.md) | EPUB 生成与验收 | book, shared-change |
-| [docs/changes/workflow-reliability.md](changes/workflow-reliability.md) | 本次流程可靠性修复范围与验收 | shared-change |
