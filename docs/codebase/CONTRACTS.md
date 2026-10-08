@@ -157,13 +157,15 @@ kind	source	target	note
 ## Adapter 命令
 
 - Typst PDF：从仓库根目录运行 `typst compile --root <repo> <entry> <temp-output>`。新书可从仓库 root import `/formats/typst/...`，旧书的相对 import 保持有效。
-- Typst EPUB：先用 `typst compile --features html --format html` 导出完整 HTML，入口中的共享语义宏必须按 `target() == "html"` 输出标题、强调、引文、诗歌、源页和概念节点；结构化 HTML 解析器处理脚注和空溯源节点，再进入共享 EPUB 写出路径。封面用同一分页入口第一页临时渲染为 PNG。Typst HTML 尚属实验功能，版本升级后必须重新运行 Adapter 测试和全书 EPUB 验收。
+- Typst EPUB：先用 `typst compile --features html --format html` 导出完整 HTML，入口中的共享语义宏必须按 `target() == "html"` 输出标题、强调、引文、诗歌、源页和概念节点；结构化 HTML 解析器处理脚注和空溯源节点，再进入共享 EPUB 写出路径。显式 `[epub].cover` 优先；未声明时才用同一分页入口第一页临时渲染为 PNG。Typst HTML 尚属实验功能，版本升级后必须重新运行 Adapter 测试和全书 EPUB 验收。
 - Markdown HTML：从仓库根目录运行 Pandoc，固定使用 `--standalone --embed-resources`，显式传入 `formats/pandoc/semantics.lua`、`formats/html/book.css` 和入口目录的 resource path，生成单文件 HTML。
 - Markdown EPUB：从仓库根目录运行 Pandoc，显式传入 `formats/pandoc/semantics.lua`、`formats/epub/book.css` 和入口目录的 resource path，进入共享 EPUB 写出路径；使用 `[epub].cover` 作为封面。
 - Markdown PDF：从仓库根目录运行 Pandoc，使用相同 Lua filter 和 `--pdf-engine=typst`。
 - HTML：入口必须是完整 HTML 文档；Adapter 原样复制，仅把可选的 `<!-- translator:book-css -->` 标记替换为含共用 CSS 的 `<style>` 元素，不经 Pandoc，不承诺内嵌其他资源。HTML QA 只检查完整文档、非空产物和遗留 CSS 标记，不替代真实浏览器验收。
 - LaTeX PDF：构建器在仓库 `.tmp/translator/` 的临时目录展开字面量 LaTeX include，规范化独占行 `\\sourcepage` 的边界后运行 `latexmk -xelatex`；正式底稿不变，编译工作目录仍为入口目录，并通过 `TEXINPUTS` 加入工作目录和仓库级 `formats/latex//`。
-- LaTeX EPUB：先在工作目录边界内递归展开字面量 `\input`、`\include` 和 `\graphicspath`，再由 Pandoc `latex+raw_tex` reader 和 `formats/pandoc/latex.lua` 映射源页、中文概念、分离脚注和交叉引用，最后进入共享 EPUB 写出路径。`\pageref` 在可重排成品中链接并显示目标编号，不伪造固定页码。allowlist 外的 raw TeX、缺失引用、动态路径和越界资源均阻止构建。`tools/latex_epub.py` 只保留兼容命令行入口。
+- LaTeX EPUB：先在工作目录边界内递归展开字面量 `\input`、`\include` 和 `\graphicspath`，再由 Pandoc `latex+raw_tex` reader 和 `formats/pandoc/latex.lua` 映射源页、中文概念、分离脚注和交叉引用，最后进入共享 EPUB 写出路径。含 `\part` 时按二级章节拆分，由 Lua 按实际章节层级编号，保持章节、图表及交叉引用编号连续；无分部时保留原路径。`\pageref` 在可重排成品中链接并显示目标编号，不伪造固定页码。allowlist 外的 raw TeX、缺失引用、动态路径和越界资源均阻止构建。`tools/latex_epub.py` 只保留兼容命令行入口。
+
+所有 EPUB Adapter 的 QA 必须核对实际封面资源；声明 `[epub].cover` 时额外按字节比较，封面与清单不一致会阻断。
 
 正式构建先写入仓库 `.tmp/translator/`。发布时允许在正式输出目录创建唯一的临时 sibling，复制完成并刷新后用 `os.replace` 原子替换，`finally` 必须清理 sibling；这是保护旧输出的唯一例外。
 

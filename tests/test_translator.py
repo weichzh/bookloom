@@ -3355,6 +3355,54 @@ class TranslatorTests(unittest.TestCase):
                 ),
                 1,
             )
+
+            with zipfile.ZipFile(output) as archive:
+                package = ET.fromstring(archive.read("EPUB/content.opf"))
+                fallback_cover = archive.read(
+                    posixpath.join(
+                        "EPUB",
+                        next(
+                            item.attrib["href"]
+                            for item in package.iter()
+                            if item.tag.rsplit("}", 1)[-1] == "item"
+                            and "cover-image"
+                            in item.attrib.get("properties", "").split()
+                        ),
+                    )
+                )
+            declared_cover = write_test_png(root / "assets" / "cover.png")
+            work.manifest["epub"]["cover"] = "assets/cover.png"
+            explicit_output = root / "explicit.epub"
+            translator.build_typst(work, language, "epub", explicit_output)
+            explicit_evidence = root / "explicit-evidence"
+            explicit_evidence.mkdir()
+            translator.qa_epub(work, language, explicit_output, explicit_evidence)
+            with zipfile.ZipFile(explicit_output) as archive:
+                entries = {name: archive.read(name) for name in archive.namelist()}
+                cover_member = posixpath.join(
+                    "EPUB",
+                    next(
+                        item.attrib["href"]
+                        for item in ET.fromstring(entries["EPUB/content.opf"]).iter()
+                        if item.tag.rsplit("}", 1)[-1] == "item"
+                        and "cover-image" in item.attrib.get("properties", "").split()
+                    ),
+                )
+            self.assertEqual(entries[cover_member], declared_cover.read_bytes())
+            entries[cover_member] = fallback_cover
+            tampered = root / "wrong-cover.epub"
+            with zipfile.ZipFile(tampered, "w") as archive:
+                mimetype = zipfile.ZipInfo("mimetype")
+                mimetype.compress_type = zipfile.ZIP_STORED
+                archive.writestr(mimetype, entries.pop("mimetype"))
+                for name, data in entries.items():
+                    archive.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
+            wrong_evidence = root / "wrong-evidence"
+            wrong_evidence.mkdir()
+            with self.assertRaisesRegex(
+                translator.CliError, "EPUB 封面与清单声明不一致"
+            ):
+                translator.qa_epub(work, language, tampered, wrong_evidence)
             self.assertEqual(
                 sum(
                     element.tag.rsplit("}", 1)[-1] == "aside"
@@ -4038,6 +4086,20 @@ class TranslatorTests(unittest.TestCase):
             with self.assertRaises(translator.CliError):
                 translator.expand_latex(work / "bad.tex", work)
 
+    def test_latex_part_detection_ignores_comments(self) -> None:
+        self.assertFalse(translator.latex_source_has_part("% \\part{忽略}\n正文\n"))
+        self.assertFalse(translator.latex_source_has_part("\\partial x\n"))
+        self.assertTrue(translator.latex_source_has_part("\\part {分部}\n"))
+        self.assertTrue(translator.latex_source_has_part("\\part*[短题]{无编号分部}\n"))
+        command = translator.latex_epub_pandoc_command(
+            root=ROOT,
+            work_path=ROOT,
+            entry=ROOT / "main.tex",
+            expanded=ROOT / "expanded.tex",
+            has_part=True,
+        )
+        self.assertIn("--metadata=translator-latex-has-part:true", command)
+
     def test_latex_include_rejects_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4193,6 +4255,79 @@ class TranslatorTests(unittest.TestCase):
             self.assertIn('href="#fig:b">1.1b</a>', xhtml)
             self.assertIn('href="ch002.xhtml#tab:image">1.2</a>', xhtml)
             self.assertIn("epubcheck=passed", (evidence / "summary.txt").read_text())
+
+    @unittest.skipUnless(
+        all(shutil.which(tool) for tool in ("pandoc", "uv", "latex", "dvisvgm")),
+        "Pandoc or SVG math tools are not installed",
+    )
+    def test_latex_epub_part_keeps_chapter_figure_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "assets").mkdir()
+            cover = write_test_png(work / "assets" / "cover.png")
+            write_test_png(work / "assets" / "diagram.png")
+            entry = work / "main.tex"
+            entry.write_text(
+                r"""\documentclass{book}
+\usepackage{graphicx}
+\graphicspath{{assets/}}
+\begin{document}
+\chapter{第一章}
+\begin{figure}\includegraphics[alt={第一图}]{diagram.png}
+\caption{第一图}\label{fig:first}\end{figure}
+参见 \ref{fig:first}。
+\part{中部}
+\chapter{第二章}
+\begin{figure}\includegraphics[alt={第二图}]{diagram.png}
+\caption{第二图}\label{fig:second}\end{figure}
+参见 \ref{fig:second}。
+\chapter{第三章}
+\begin{figure}\includegraphics[alt={第三图}]{diagram.png}
+\caption{第三图}\label{fig:third}\end{figure}
+参见 \ref{fig:third}。
+\part*{后部}
+\chapter{第四章}
+\begin{figure}\includegraphics[alt={第四图}]{diagram.png}
+\caption{第四图}\label{fig:fourth}\end{figure}
+参见 \ref{fig:fourth}。
+\end{document}
+""",
+                encoding="utf-8",
+            )
+            output = work / "sample.epub"
+            translator.build_latex_epub_source(
+                root=ROOT,
+                work_path=work,
+                entry=entry,
+                output=output,
+                title="Part numbering",
+                author=None,
+                language="zh-CN",
+                identifier="urn:test:latex-part",
+                cover=cover,
+            )
+            with zipfile.ZipFile(output) as archive:
+                documents = [
+                    ET.fromstring(archive.read(name))
+                    for name in archive.namelist()
+                    if name.endswith(".xhtml")
+                ]
+                xhtml = "\n".join(
+                    ET.tostring(document, encoding="unicode")
+                    for document in documents
+                )
+            self.assertRegex(xhtml, r'href="[^"]*#fig:first">1\.1</a>')
+            self.assertRegex(xhtml, r'href="[^"]*#fig:second">2\.1</a>')
+            self.assertRegex(xhtml, r'href="[^"]*#fig:third">3\.1</a>')
+            self.assertRegex(xhtml, r'href="[^"]*#fig:fourth">4\.1</a>')
+            headings = [
+                re.sub(r"\s+", " ", "".join(element.itertext())).strip()
+                for document in documents
+                for element in document.iter()
+                if element.tag.rsplit("}", 1)[-1] in {"h1", "h2", "h3", "h4"}
+            ]
+            for number, title in enumerate(("第一章", "第二章", "第三章", "第四章"), 1):
+                self.assertIn(f"{number} {title}", headings)
 
     @unittest.skipUnless(
         all(shutil.which(tool) for tool in ("pandoc", "uv", "latex", "dvisvgm")),

@@ -4762,7 +4762,7 @@ def build_typst(work: Work, language: Language, target: str, output: Path) -> No
         temporary = Path(directory)
         raw_html = temporary / "book.html"
         normalized_html = temporary / "book-normalized.html"
-        cover = temporary / "cover.png"
+        cover = explicit_epub_cover_path(work)
         generated_epub = temporary / "book.epub"
         run(
             [
@@ -4782,24 +4782,26 @@ def build_typst(work: Work, language: Language, target: str, output: Path) -> No
         text = raw_html.read_text(encoding="utf-8")
         validate_html(text, str(raw_html))
         normalized_html.write_text(normalize_typst_html(text), encoding="utf-8")
-        run(
-            [
-                "typst",
-                "compile",
-                "--root",
-                str(work.root),
-                "--format",
-                "png",
-                "--pages",
-                "1",
-                "--ppi",
-                "216",
-                str(language.entry),
-                str(cover),
-            ],
-            cwd=work.root,
-        )
-        png_dimensions(cover)
+        if cover is None:
+            cover = temporary / "cover.png"
+            run(
+                [
+                    "typst",
+                    "compile",
+                    "--root",
+                    str(work.root),
+                    "--format",
+                    "png",
+                    "--pages",
+                    "1",
+                    "--ppi",
+                    "216",
+                    str(language.entry),
+                    str(cover),
+                ],
+                cwd=work.root,
+            )
+            png_dimensions(cover)
         command = [
             "pandoc",
             str(normalized_html),
@@ -4849,11 +4851,18 @@ def pandoc_base(work: Work, language: Language) -> list[str]:
     ]
 
 
-def epub_cover_path(work: Work) -> Path | None:
+def explicit_epub_cover_path(work: Work) -> Path | None:
     epub_data = work.manifest.get("epub")
     cover_raw = epub_data.get("cover") if isinstance(epub_data, dict) else None
     if isinstance(cover_raw, str) and cover_raw:
         return inside(work.path, cover_raw, "epub.cover")
+    return None
+
+
+def epub_cover_path(work: Work) -> Path | None:
+    explicit = explicit_epub_cover_path(work)
+    if explicit is not None:
+        return explicit
     fallback = work.path / "assets" / "cover.png"
     return fallback if fallback.is_file() else None
 
@@ -4939,17 +4948,27 @@ def latex_epub_source_text(entry: Path, work_path: Path) -> str:
     )
 
 
+def latex_source_has_part(text: str) -> bool:
+    return re.search(
+        r"\\part(?![A-Za-z@])\s*\*?\s*(?:\[[^\]]*\]\s*)?\{",
+        mask_latex_comments(text),
+    ) is not None
+
+
 def latex_epub_pandoc_command(
-    *, root: Path, work_path: Path, entry: Path, expanded: Path
+    *, root: Path, work_path: Path, entry: Path, expanded: Path, has_part: bool = False
 ) -> list[str]:
     resource_path = os.pathsep.join((str(entry.parent), str(work_path), str(root)))
-    return [
+    command = [
         "pandoc",
         str(expanded),
         "--from=latex+raw_tex",
         f"--lua-filter={root / 'formats/pandoc/latex.lua'}",
         f"--resource-path={resource_path}",
     ]
+    if has_part:
+        command.append("--metadata=translator-latex-has-part:true")
+    return command
 
 
 def preflight_latex_epub(work: Work, language: Language) -> None:
@@ -4960,10 +4979,8 @@ def preflight_latex_epub(work: Work, language: Language) -> None:
         temporary = Path(directory)
         expanded = temporary / "expanded.tex"
         ast = temporary / "source.json"
-        expanded.write_text(
-            latex_epub_source_text(language.entry, work.path),
-            encoding="utf-8",
-        )
+        source_text = latex_epub_source_text(language.entry, work.path)
+        expanded.write_text(source_text, encoding="utf-8")
         run(
             [
                 *latex_epub_pandoc_command(
@@ -4971,6 +4988,7 @@ def preflight_latex_epub(work: Work, language: Language) -> None:
                     work_path=work.path,
                     entry=language.entry,
                     expanded=expanded,
+                    has_part=latex_source_has_part(source_text),
                 ),
                 "--to=json",
                 "-o",
@@ -5012,21 +5030,20 @@ def build_latex_epub_source(
         temporary = Path(directory)
         expanded = temporary / "expanded.tex"
         normalized = temporary / "book.epub"
-        expanded.write_text(
-            latex_epub_source_text(entry, work_path),
-            encoding="utf-8",
-        )
+        source_text = latex_epub_source_text(entry, work_path)
+        expanded.write_text(source_text, encoding="utf-8")
+        has_part = latex_source_has_part(source_text)
         command = latex_epub_pandoc_command(
             root=root,
             work_path=work_path,
             entry=entry,
             expanded=expanded,
+            has_part=has_part,
         )
         writer_options = [
             "--toc",
             "--toc-depth=3",
-            "--split-level=1",
-            "--number-sections",
+            f"--split-level={2 if has_part else 1}",
             "--top-level-division=chapter",
             f"--css={root / 'formats/epub/book.css'}",
             f"--css={root / 'formats/epub/latex.css'}",
@@ -5035,6 +5052,8 @@ def build_latex_epub_source(
             f"--metadata=identifier:{identifier}",
             f"--epub-cover-image={cover}",
         ]
+        if not has_part:
+            writer_options.append("--number-sections")
         if author:
             writer_options.append(f"--metadata=author:{author}")
         if date:
@@ -5595,6 +5614,7 @@ def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> Non
             or item.attrib.get("id") == "cover-image"
         ]
         cover_path = epub_cover_path(work)
+        explicit_cover_path = explicit_epub_cover_path(work)
         if cover_path and not cover_path.is_file():
             raise CliError(f"EPUB 工作区封面不存在：{cover_path}")
         if not cover_items:
@@ -5605,6 +5625,11 @@ def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> Non
             raise CliError(f"EPUB 封面不是图像资源：{output}")
         if cover_member not in names:
             raise CliError(f"EPUB 封面资源不存在：{cover_member}")
+        if (
+            explicit_cover_path is not None
+            and archive.read(cover_member) != explicit_cover_path.read_bytes()
+        ):
+            raise CliError(f"EPUB 封面与清单声明不一致：{output}")
     outline_path = evidence / "outline.txt"
     outline_path.write_text(toc_outline, encoding="utf-8")
     run_epubcheck(output, evidence)

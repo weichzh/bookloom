@@ -369,6 +369,13 @@ local function fallback_image_alt(element)
 end
 
 local function collect_labels(document)
+  local has_part = pandoc.utils.stringify(
+    document.meta["translator-latex-has-part"] or ""
+  ) == "true"
+  local chapter_level = has_part and 2 or 1
+  local section_level = chapter_level + 1
+  local subsection_level = section_level + 1
+  local part = 0
   local chapter = 0
   local section = 0
   local subsection = 0
@@ -378,6 +385,19 @@ local function collect_labels(document)
   local pending_counter
   local counter_formats = {}
   local thefigure_values = {}
+
+  local function number_header(block, display)
+    local content = pandoc.Inlines({
+      pandoc.Span(
+        { pandoc.Str(display) },
+        pandoc.Attr("", { "header-section-number" })
+      ),
+      pandoc.Space(),
+    })
+    content:extend(block.content)
+    block.content = content
+    block.classes:insert("unnumbered")
+  end
 
   local function scoped(number)
     return chapter > 0 and (chapter .. "." .. number) or tostring(number)
@@ -571,7 +591,10 @@ local function collect_labels(document)
       if block.t == "Header" then
         local custom_display
         if not has_class(block, "unnumbered") then
-          if block.level == 1 then
+          if has_part and block.level == 1 then
+            part = part + 1
+            custom_display = tostring(part)
+          elseif block.level == chapter_level then
             chapter = chapter + 1
             section = 0
             subsection = 0
@@ -579,24 +602,25 @@ local function collect_labels(document)
             table_number = 0
             equation = 0
             pending_counter = nil
-          elseif block.level == 2 then
+            if has_part then
+              custom_display = tostring(chapter)
+            end
+          elseif block.level == section_level then
             section = section + 1
             subsection = 0
             if counter_formats.section then
               custom_display = formatted_counter("section")
-              local content = pandoc.Inlines({
-                pandoc.Span(
-                  { pandoc.Str(custom_display) },
-                  pandoc.Attr("", { "header-section-number" })
-                ),
-                pandoc.Space(),
-              })
-              content:extend(block.content)
-              block.content = content
-              block.classes:insert("unnumbered")
+            elseif has_part then
+              custom_display = chapter .. "." .. section
             end
-          elseif block.level == 3 then
+          elseif block.level == subsection_level then
             subsection = subsection + 1
+            if has_part then
+              custom_display = chapter .. "." .. section .. "." .. subsection
+            end
+          end
+          if custom_display then
+            number_header(block, custom_display)
           end
         end
         if block.identifier ~= "" then
@@ -604,11 +628,11 @@ local function collect_labels(document)
           if custom_display then
             display = custom_display
           elseif not has_class(block, "unnumbered") then
-            if block.level == 1 then
+            if block.level == chapter_level then
               display = tostring(chapter)
-            elseif block.level == 2 then
+            elseif block.level == section_level then
               display = chapter .. "." .. section
-            elseif block.level == 3 then
+            elseif block.level == subsection_level then
               display = chapter .. "." .. section .. "." .. subsection
             end
           end
