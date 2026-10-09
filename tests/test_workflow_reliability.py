@@ -255,6 +255,25 @@ class WorkflowReliabilityTests(unittest.TestCase):
                     translator.command_source_draft(draft_args)
                 scratch = translator.scratch_dir(work, "intake-probe")
                 self.assertEqual(len(list(scratch.glob("source-draft-*/draft.md"))), 2)
+                reports = list(scratch.glob("source-probe-*/profile.json"))
+                self.assertEqual(len(reports), 2)
+                self.assertTrue(all(json.loads(path.read_text(encoding="utf-8"))["ready_for_draft"] for path in reports))
+                # A full report must survive failed intake, without a partial draft.
+                with zipfile.ZipFile(source) as archive:
+                    payloads = {name: archive.read(name) for name in archive.namelist()}
+                payloads["OEBPS/a.xhtml"] = b"<html><body><figure><p>Figure prose</p></figure></body></html>"
+                with zipfile.ZipFile(source, "w") as archive:
+                    for name, payload in payloads.items():
+                        archive.writestr(name, payload)
+                # This is an isolated fixture, never the Books source under test.
+                work.manifest["source"]["sha256"] = translator.sha256(source)
+                with (
+                    mock.patch.object(translator, "load_work", return_value=work),
+                    self.assertRaisesRegex(translator.CliError, "来源探查报告"),
+                ):
+                    translator.command_source_draft(draft_args)
+                self.assertEqual(len(list(scratch.glob("source-probe-*/profile.json"))), 3)
+                self.assertEqual(len(list(scratch.glob("source-draft-*/draft.md"))), 2)
                 with (
                     mock.patch.object(translator, "REPO_ROOT", root),
                     self.assertRaisesRegex(translator.CliError, "不会覆盖"),

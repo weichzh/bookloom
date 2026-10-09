@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 from tools import epub_source
@@ -283,6 +284,192 @@ class EpubSourceTests(unittest.TestCase):
         self.assertIn("空 Notes 容器已显式保留", result.warnings)
         self.assertIn("::: {#notes .endnotes}", result.markdown)
         self.assertIn("\n:::\n", result.markdown)
+
+    def test_explicit_endnote_keeps_backlink_body_text(self) -> None:
+        source = (
+            '<html xmlns="http://www.w3.org/1999/xhtml" '
+            'xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+            '<p><a id="ref" href="#en0_1" epub:type="noteref">1</a></p>'
+            '<section epub:type="endnotes"><ol><li id="en0_1" '
+            'epub:type="endnote"><a href="#ref" epub:type="backlink">'
+            'Beginning <i>text</i></a> and continuation.</li></ol></section>'
+            '</body></html>'
+        )
+        result = epub_source.convert_xhtml(source, href="unit.xhtml")
+        self.assertIn("[^en0_1]", result.markdown)
+        self.assertIn("Beginning *text*", result.markdown)
+        self.assertIn("and continuation.", result.markdown)
+        epub_source.verify_drafts([result])
+        with self.assertRaisesRegex(epub_source.EpubSourceError, "正文|文字"):
+            epub_source.verify_drafts([
+                replace(result, markdown=result.markdown.replace("Beginning ", ""))
+            ])
+
+    def test_class_name_does_not_discard_or_reinterpret_prose(self) -> None:
+        source = (
+            '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+            '<section class="notes"><p>Ordinary notes prose.</p></section>'
+            '<div class="quote"><p>A quoted price.</p></div>'
+            '</body></html>'
+        )
+        result = epub_source.convert_xhtml(source, href="unit.xhtml")
+        self.assertIn("Ordinary notes prose.", result.markdown)
+        self.assertNotIn("> A quoted price.", result.markdown)
+        epub_source.verify_drafts([result])
+
+    def test_nonempty_unrecognized_note_container_is_not_called_empty(self) -> None:
+        source = (
+            '<html xmlns="http://www.w3.org/1999/xhtml" '
+            'xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+            '<section epub:type="endnotes"><p>Unclassified text.</p></section>'
+            '</body></html>'
+        )
+        with self.assertRaisesRegex(epub_source.EpubSourceError, "非空|未消费"):
+            epub_source.convert_xhtml(source, href="unit.xhtml")
+
+    def test_file_scoped_ids_and_cross_file_notes(self) -> None:
+        body = (
+            '<html xmlns="http://www.w3.org/1999/xhtml" '
+            'xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+            '<h1 id="same">Chapter</h1><p><a href="notes.xhtml#same">Section</a> '
+            '<a href="notes.xhtml">Whole document</a> '
+            '<a id="ref" href="notes.xhtml#en0_1" epub:type="noteref">1</a></p>'
+            '</body></html>'
+        )
+        notes = (
+            '<html xmlns="http://www.w3.org/1999/xhtml" '
+            'xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+            '<h1 id="same">Notes</h1><section epub:type="endnotes"><ol>'
+            '<li id="en0_1" epub:type="endnote"><a href="ch1.xhtml#ref" '
+            'epub:type="backlink">Beginning</a> of a note.</li>'
+            '</ol></section></body></html>'
+        )
+        with self.temporary_directory() as directory:
+            source = _write_epub(Path(directory), body=body, extra={
+                "OEBPS/text/notes.xhtml": notes,
+            })
+            _, drafts = epub_source.render_epub(source)
+            locations = [location for draft in drafts for location in draft.locations]
+            headings = [location for location in locations if location.source_id == "same"]
+            self.assertEqual(len(headings), 2)
+            self.assertNotEqual(headings[0].target_id, headings[1].target_id)
+            self.assertIn(f"(#{headings[1].target_id})", drafts[0].markdown)
+            document = next(location for location in drafts[1].locations if location.kind == "document")
+            self.assertIn(f"(#{document.target_id})", drafts[0].markdown)
+            note = next(location for location in locations if location.kind == "note")
+            self.assertIn(f"[^{note.target_id}]", drafts[0].markdown)
+            epub_source.verify_drafts(drafts)
+
+    def test_probe_reports_all_unknown_structures_without_converting(self) -> None:
+        body = (
+            '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+            '<figure><img src="other.png" alt="diagram"/></figure>'
+            '<table><tr><td>Data</td></tr></table></body></html>'
+        )
+        other = (
+            '<html xmlns="http://www.w3.org/1999/xhtml"><body><p>'
+            '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>'
+            '</p></body></html>'
+        )
+        with self.temporary_directory() as directory:
+            source = _write_epub(Path(directory), body=body, extra={
+                "OEBPS/text/notes.xhtml": other,
+            })
+            _, profile = epub_source.probe_epub(source)
+            self.assertEqual(len(profile["units"]), 2)
+            self.assertFalse(profile["ready_for_draft"])
+            self.assertEqual(
+                {issue["tag"] for issue in profile["issues"] if issue["code"] == "unsupported_element"},
+                {"figure", "table", "math"},
+            )
+            self.assertTrue(all(issue["locator"] for issue in profile["issues"]))
+
+    def test_draft_verification_rejects_heading_demoted_to_prose(self) -> None:
+        source = '<html xmlns="http://www.w3.org/1999/xhtml"><body><h3 id="s">Section</h3></body></html>'
+        result = epub_source.convert_xhtml(source, href="unit.xhtml")
+        epub_source.verify_drafts([result])
+        broken = replace(result, markdown="[]{#page}" + result.markdown)
+        with self.assertRaisesRegex(epub_source.EpubSourceError, "标题|结构"):
+            epub_source.verify_drafts([broken])
+
+    def test_note_heading_and_mixed_backlink_blocks_survive(self) -> None:
+        source = (
+            '<html xmlns:epub="http://www.idpf.org/2007/ops"><body><div>'
+            '<h1 id="h">Part<br/>Title</h1>'
+            '<p><a id="r" href="#n" epub:type="noteref">1</a></p>'
+            '<section epub:type="endnotes"><h2 id="notes">Notes</h2><ol>'
+            '<li id="n" epub:type="endnote"><a href="#r" epub:type="backlink">'
+            'Beginning</a> of note.<p>Second paragraph.</p></li></ol>'
+            '</section></div></body></html>'
+        )
+        result = epub_source.convert_xhtml(source, href="unit.xhtml", unit=1, include_unit_marker=True)
+        self.assertIn('::: {}', result.markdown)
+        self.assertIn('[]{.line-break}', result.markdown)
+        self.assertEqual(epub_source.verify_drafts([result])["headings"], 2)
+
+    def test_heading_only_unit_keeps_heading_id(self) -> None:
+        source = '<html><body><h1 id="h">Part title</h1></body></html>'
+        result = epub_source.convert_xhtml(source, href="unit.xhtml", unit=1, include_unit_marker=True)
+        epub_source.verify_drafts([result])
+
+    def test_probe_rejects_unsupported_context_and_standalone_note(self) -> None:
+        cases = (
+            'Literal body text', '<span>Inline root</span>',
+            '<a href="other.xhtml#target">Inline root</a>',
+            '<aside id="n1" epub:type="footnote">Note</aside>',
+        )
+        for contents in cases:
+            with self.subTest(contents=contents), self.temporary_directory() as directory:
+                source = _write_epub(Path(directory), body=(
+                    '<html xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+                    + contents + '</body></html>'
+                ))
+                _, profile = epub_source.probe_epub(source)
+                self.assertFalse(profile["ready_for_draft"])
+                self.assertTrue(profile["issues"])
+
+    def test_cross_file_fragment_does_not_classify_local_notes(self) -> None:
+        source = (
+            '<html><body><p><a href="other.xhtml#en1">Other</a></p>'
+            '<section class="notes"><p id="en1">Ordinary local prose.</p></section>'
+            '</body></html>'
+        )
+        result = epub_source.convert_xhtml(source, href="unit.xhtml",
+            package_targets={"unit.xhtml": {"en1"}, "other.xhtml": {"en1"}})
+        self.assertFalse(result.expected_notes)
+        self.assertNotIn('[^en1]', result.markdown)
+        epub_source.verify_drafts([result])
+
+    def test_inline_and_document_target_ids_exist_after_parse(self) -> None:
+        source = (
+            '<html id="root"><body id="body"><h1>Heading</h1><p>'
+            'Text<br id="br"/>x<sup id="sup">2</sup>y<sub id="sub">1</sub>'
+            '<a href="#br">break</a><a href="#sup">sup</a>'
+            '<a href="#sub">sub</a><a href="#body">body</a><a href="#root">root</a>'
+            '</p><hr id="rule"/><p><a href="#rule">rule</a></p></body></html>'
+        )
+        result = epub_source.convert_xhtml(source, href="unit.xhtml")
+        self.assertEqual({loc.source_id for loc in result.locations}, {"root", "body", "br", "sup", "sub", "rule"})
+        epub_source.verify_drafts([result])
+        with self.assertRaisesRegex(epub_source.EpubSourceError, "锚点|链接"):
+            epub_source.verify_drafts([replace(result, markdown=result.markdown.replace('[]{#br}', ''))])
+
+    def test_named_anchor_and_query_note_intake(self) -> None:
+        body = '<html><body><p><a id="target"/>Text <a href="#target">jump</a>.</p></body></html>'
+        with self.temporary_directory() as directory:
+            source = _write_epub(Path(directory), body=body)
+            _, profile = epub_source.probe_epub(source)
+            self.assertTrue(profile["ready_for_draft"])
+            _, drafts = epub_source.render_epub(source)
+            epub_source.verify_drafts(drafts)
+        query_note = (
+            '<html xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+            '<p><a href="unit.xhtml?mode=print#n" epub:type="noteref">1</a></p>'
+            '<section epub:type="endnotes"><ol><li id="n" epub:type="endnote">Note</li>'
+            '</ol></section></body></html>'
+        )
+        with self.assertRaisesRegex(epub_source.EpubSourceError, "查询参数"):
+            epub_source.convert_xhtml(query_note, href="unit.xhtml")
 
     def test_write_drafts_requires_scratch_containment(self) -> None:
         with self.temporary_directory() as directory:

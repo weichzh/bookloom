@@ -2,4 +2,6 @@
 
 本文件只登记当前可执行工作流的路由；具体状态由所指向的所有者保存。
 
-当前没有活动工作流。
+- `shared-change`：[EPUB 来源探查与信息保全](changes/epub-source-intake.md) → `docs/changes/epub-source-intake.md`。
+
+Context Bundle：协议、该 change、`docs/codebase/CONTRACTS.md`；直接证据为 `tools/epub_source.py` 和来源回归测试。

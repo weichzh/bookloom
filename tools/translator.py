@@ -186,6 +186,7 @@ WORK_COMMANDS = frozenset(
         "prepare",
         "scratch",
         "source-draft",
+        "source-probe",
     }
 )
 ACTIVITIES = (
@@ -3340,15 +3341,37 @@ def command_scratch(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_source_draft(args: argparse.Namespace) -> int:
-    work = load_command_work(args)
+def source_probe(work: Work, agent: str) -> tuple[Any, dict[str, object], Path, Path]:
     if work.source.suffix.lower() != ".epub":
-        raise CliError("source-draft 只支持 EPUB 原生来源")
+        raise CliError("source-probe/source-draft 只支持 EPUB 原生来源")
     if sha256(work.source) != str(work.manifest["source"]["sha256"]).upper():
         raise CliError("EPUB 来源哈希与 manifest 不一致")
-    scratch = scratch_dir(work, args.agent)
+    scratch = scratch_dir(work, agent)
     try:
+        package, profile = epub_source.probe_epub(work.source)
+        report = epub_source.write_probe(
+            profile, scratch / f"source-probe-{workflow_run_id()}", scratch_root=scratch
+        )
+    except epub_source.EpubSourceError as error:
+        raise CliError(str(error)) from error
+    return package, profile, report, scratch
+
+
+def command_source_probe(args: argparse.Namespace) -> int:
+    _, profile, report, _ = source_probe(load_command_work(args), args.agent)
+    print(json.dumps({"profile": str(report), "ready_for_draft": profile["ready_for_draft"],
+                      "issues": len(profile["issues"]), "verified": False}, ensure_ascii=False))
+    return 0
+
+
+def command_source_draft(args: argparse.Namespace) -> int:
+    work = load_command_work(args)
+    _, profile, report, scratch = source_probe(work, args.agent)
+    try:
+        if not profile["ready_for_draft"]:
+            raise epub_source.EpubSourceError(f"来源探查发现 {len(profile['issues'])} 个待处理问题")
         package, drafts = epub_source.render_epub(work.source)
+        text_check = epub_source.verify_drafts(drafts)
         paths, mapping = epub_source.write_drafts(
             package,
             drafts,
@@ -3356,12 +3379,14 @@ def command_source_draft(args: argparse.Namespace) -> int:
             scratch_root=scratch,
         )
     except epub_source.EpubSourceError as error:
-        raise CliError(str(error)) from error
+        raise CliError(f"{error}；来源探查报告：{report}") from error
     print(
         json.dumps(
             {
                 "drafts": [str(path) for path in paths],
                 "source_map": str(mapping),
+                "profile": str(report),
+                "text_check": text_check,
                 "verified": False,
             },
             ensure_ascii=False,
@@ -7088,7 +7113,13 @@ def parser() -> argparse.ArgumentParser:
     add_station_arguments(scratch)
     scratch.set_defaults(handler=command_scratch)
 
-    source_draft = commands.add_parser("source-draft", help="在 scratch 生成原生 EPUB 语义草稿和来源映射，仍需视觉核定")
+    source_probe_parser = commands.add_parser("source-probe", help="完整探查 EPUB 来源结构，在 scratch 保存报告")
+    source_probe_parser.add_argument("work")
+    source_probe_parser.add_argument("--agent", required=True)
+    add_station_arguments(source_probe_parser)
+    source_probe_parser.set_defaults(handler=command_source_probe)
+
+    source_draft = commands.add_parser("source-draft", help="先探查并检查信息保全，再生成 EPUB 草稿，仍需视觉核定")
     source_draft.add_argument("work")
     source_draft.add_argument("--agent", required=True)
     add_station_arguments(source_draft)

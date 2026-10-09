@@ -127,7 +127,9 @@ kind	source	target	note
 
 - `init` 只创建不存在的单书工作目录和初始契约文件，不覆盖已有工作。EPUB 无 `Page_N` 时按 OPF spine 初始化 `source-units.tsv`，不伪造页码；此路径使用 Markdown 或 HTML。损坏包、重复锚点或非法 spine 阻断，不用 fallback 掩盖。
 - `scratch WORK --agent NAME` 输出 JSON 路径和来源哈希，创建安全命名的作品临时分片；不清理已有文件。
-- `source-draft WORK --agent NAME` 在 scratch 的每次独立运行目录生成原生 XHTML 的 Markdown 草稿和来源映射；不覆盖旧草稿，复验不需先删除分片。使用正式 reader flags，保留原生语义并报告不支持或歧义，不写正式底稿、进度或译文。草稿仍需逐单元视觉核定。
+- `source-probe WORK --agent NAME` 只读探查全部 EPUB spine，在 scratch 的独立目录保存 `profile.json`：来源哈希、逐单元元素／class／显式语义／ID／链接／样式依赖，以及可定位的不支持项。class 只作为来源事实，不推断引文或尾注。`ready_for_draft` 只表示探查未发现已知阻塞；不保证后续转换、内容或视觉验收通过。
+- `source-draft WORK --agent NAME` 先保存同一完整探查报告；存在阻塞时停止并返回报告路径。通过初步探查后，在独立目录生成 `draft.md` 和 `source-map.json`，不覆盖旧草稿，不写正式底稿、进度或译文。映射保留 `href` 与原 `source_id`，以确定的 `target_id` 重写合并范围内的片段和文件入口链接；同文件重复 ID、缺失目标仍阻断。带查询参数的包内链接、独立显式脚注和复杂图表／MathML 本轮仍须先研究。
+- 草稿转换检查未消费来源文字，再以正式 reader 核对正文非空白字符保全、各注释的有序文字、标题层级、实际锚点和链接目标；正文字符检查不证明阅读顺序、样式或全部语义正确。明确尾注容器的标题与回链正文保留，非空未识别 Notes 不输出为空容器。机器通过仍返回 `verified: false`，需要逐单元内容和视觉核定；纯标题单元内的 source-unit 草稿标记会警告，正式底稿仍按翻译流程安置。
 - `station [WORK]` 是不运行书籍检查或构建的工站边界；没有具体作品的文档、代码和协调活动使用默认 `project` lane。
 - `doctor` 只探测所选用途实际需要的工具；`--for all` 另外执行权威文档入口漂移检查。
 - `render` 把指定来源页渲染到该书隔离的临时证据目录。

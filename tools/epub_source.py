@@ -17,11 +17,13 @@ import hashlib
 import json
 import posixpath
 import re
+import subprocess
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Self
 
@@ -44,6 +46,15 @@ _NOTE_ID_RE = re.compile(r"(?:^|_)en\d+$", re.IGNORECASE)
 _SKIP_HEAD_TAGS = {"head", "title", "meta", "link", "style", "script"}
 _NOTE_CLASS_TOKENS = {"footnotes", "endnotes", "notes"}
 _NOTE_CLASS_RE = re.compile(r"(?:^|[-_])footnote(?:[-_]|$)|(?:^|[-_])endnote(?:[-_]|$)")
+_EPUB_TYPE = "{http://www.idpf.org/2007/ops}type"
+_NOTE_TYPES = {"footnote", "endnote"}
+_NOTE_ROLES = {"doc-footnote", "doc-endnote"}
+_BLOCK_TAGS = {"body", "section", "div", "aside", "article", "header", "footer",
+               "p", "blockquote", "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
+_SUPPORTED_TAGS = _BLOCK_TAGS | _SKIP_HEAD_TAGS | {
+    "span", "a", "i", "em", "b", "strong", "u", "br", "img", "sup", "sub",
+    "code", "q", "abbr", "cite", "small", "mark", "hr",
+}
 
 
 class EpubSourceError(ValueError):
@@ -126,6 +137,7 @@ class SourceLocation:
     source_id: str
     kind: str
     markdown_line: int
+    target_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -134,6 +146,7 @@ class SourceLocation:
             "source_id": self.source_id,
             "kind": self.kind,
             "markdown_line": self.markdown_line,
+            "target_id": self.target_id or self.source_id,
         }
 
 
@@ -144,6 +157,10 @@ class ConversionResult:
     markdown: str
     locations: tuple[SourceLocation, ...]
     warnings: tuple[str, ...] = ()
+    expected_text: str = field(default="", repr=False)
+    expected_notes: Mapping[str, str] = field(default_factory=dict, repr=False)
+    expected_heading_levels: tuple[int, ...] = ()
+    expected_ids: tuple[str, ...] = ()
 
     def source_map(self) -> list[dict[str, object]]:
         return [location.as_dict() for location in self.locations]
@@ -415,9 +432,9 @@ def read_source_units(path: str | Path) -> tuple[dict[str, str], ...]:
     return read_epub(path).source_unit_rows()
 
 
-def _attrs(element: ET.Element, *, include_id: bool = True) -> str:
+def _attrs(element: ET.Element, *, include_id: bool = True, target_id: str | None = None) -> str:
     values: list[str] = []
-    element_id = element.attrib.get("id") if include_id else None
+    element_id = (target_id or element.attrib.get("id")) if include_id else None
     if element_id:
         if _ID_RE.fullmatch(element_id):
             values.append(f"#{element_id}")
@@ -496,6 +513,8 @@ def _href_for_markdown(current_href: str, raw_href: str) -> tuple[str, str | Non
     parsed = urllib.parse.urlsplit(raw_href.strip())
     if parsed.scheme or parsed.netloc:
         return raw_href.strip(), urllib.parse.unquote(parsed.fragment) or None
+    if parsed.query:
+        raise EpubSourceError("含查询参数的包内链接需要先研究其来源语义")
     path = urllib.parse.unquote(parsed.path)
     fragment = urllib.parse.unquote(parsed.fragment) or None
     if not path:
@@ -509,6 +528,15 @@ def _href_for_markdown(current_href: str, raw_href: str) -> tuple[str, str | Non
     ), fragment
 
 
+def _link_identity(href: str, raw_href: str) -> tuple[str, str] | None:
+    parsed = urllib.parse.urlsplit(raw_href.strip())
+    if parsed.scheme or parsed.netloc:
+        return None
+    path = _safe_package_member(posixpath.join(posixpath.dirname(href),
+        urllib.parse.unquote(parsed.path)), label="链接目标") if parsed.path else href
+    return path, urllib.parse.unquote(parsed.fragment)
+
+
 class _Renderer:
     def __init__(
         self,
@@ -518,6 +546,8 @@ class _Renderer:
         target_ids: Mapping[str, set[str]],
         package_members: set[str],
         strict_links: bool,
+        qualified_ids: Mapping[tuple[str, str], str] | None = None,
+        package_notes: Mapping[str, set[str]] | None = None,
     ):
         self.unit = unit
         self.href = href
@@ -528,19 +558,56 @@ class _Renderer:
         self.locations: list[SourceLocation] = []
         self.warnings: list[str] = []
         self.current_note_ids: set[str] = set()
+        self.qualified_ids = qualified_ids or {}
+        self.package_notes = package_notes or {}
+        self.note_nodes: set[int] = set()
+        self.note_reference_ids: dict[str, str] = {}
+        self.consumed: set[tuple[int, str]] = set()
+        self.excluded: set[tuple[int, str]] = set()
+        self.in_heading = False
+
+    def target_id(self, source_id: str, href: str | None = None) -> str:
+        return self.qualified_ids.get((href or self.href, source_id), source_id)
+
+    def attrs(self, element: ET.Element) -> str:
+        source_id = element.get("id")
+        return _attrs(element, target_id=self.target_id(source_id) if source_id else None)
+
+    def text(self, element: ET.Element, slot: str = "text") -> str:
+        self.consumed.add((id(element), slot))
+        return _escape_text(getattr(element, slot) or "")
+
+    def exclude(self, element: ET.Element) -> None:
+        # The root's tail belongs to the surrounding prose, not this subtree.
+        for descendant in element.iter():
+            self.excluded.add((id(descendant), "text"))
+            if descendant is not element:
+                self.excluded.add((id(descendant), "tail"))
+
+    def mapped_href(self, raw_href: str, rendered_href: str) -> str:
+        parsed = urllib.parse.urlsplit(raw_href)
+        if parsed.scheme or parsed.netloc:
+            return rendered_href
+        if parsed.query:
+            raise EpubSourceError("含查询参数的包内链接需要先研究其来源语义")
+        path = _safe_package_member(posixpath.join(posixpath.dirname(self.href),
+                    urllib.parse.unquote(parsed.path))) if parsed.path else self.href
+        key = (path, urllib.parse.unquote(parsed.fragment))
+        return "#" + self.qualified_ids[key] if key in self.qualified_ids else rendered_href
 
     def _line(self) -> int:
         return len(self.lines) + 1
 
     def _record(self, element_id: str, kind: str) -> None:
         self.locations.append(
-            SourceLocation(self.unit, self.href, element_id, kind, self._line())
+            SourceLocation(self.unit, self.href, element_id, kind, self._line(), self.target_id(element_id))
         )
 
     def marker(
         self, element_id: str, kind: str = "anchor", attrs: str | None = None
     ) -> str:
         self._record(element_id, kind)
+        element_id = self.target_id(element_id)
         if attrs is None:
             attr_text = (
                 f"#{element_id}"
@@ -587,10 +654,10 @@ class _Renderer:
     def inline(self, element: ET.Element | None) -> str:
         if element is None:
             return ""
-        result = _escape_text(element.text or "")
+        result = self.text(element)
         for child in list(element):
             result += self._inline_node(child)
-            result += _escape_text(child.tail or "")
+            result += self.text(child, "tail")
         if element.attrib.get("id") and _local(element.tag) in {
             "i",
             "em",
@@ -610,6 +677,7 @@ class _Renderer:
     def _inline_node(self, child: ET.Element) -> str:
         tag = _local(child.tag)
         if tag in _SKIP_HEAD_TAGS:
+            self.exclude(child)
             return ""
         if tag in {"i", "em"}:
             return f"*{self.inline(child)}*"
@@ -618,7 +686,8 @@ class _Renderer:
         if tag == "u":
             return f"[{self.inline(child)}]{{.underline}}"
         if tag == "br":
-            return "  \n"
+            marker = self.marker(child.attrib["id"], "break") if child.get("id") else ""
+            return marker + ("[]{.line-break}" if self.in_heading else "  \n")
         if tag == "img":
             raw_src = child.attrib.get("src", "")
             if not raw_src:
@@ -633,30 +702,45 @@ class _Renderer:
         if tag == "a":
             raw_href = child.attrib.get("href", "")
             if not raw_href:
+                if child.get("id") and not (_tokens(child.get(_EPUB_TYPE)) & {"noteref"}
+                                             or _tokens(child.get("role")) & {"doc-noteref"}):
+                    return self.marker(child.attrib["id"], "anchor") + self.inline(child)
                 raise EpubSourceError("链接缺少 href")
             rendered_href, fragment = _href_for_markdown(self.href, raw_href)
-            note_target = fragment if not urllib.parse.urlsplit(raw_href).path else None
-            if note_target in self.current_note_ids:
+            parsed = urllib.parse.urlsplit(raw_href)
+            note_href = self.href
+            if not parsed.scheme and not parsed.netloc and parsed.path:
+                note_href = _safe_package_member(posixpath.join(posixpath.dirname(self.href),
+                                urllib.parse.unquote(parsed.path)))
+            note_ids = self.package_notes.get(note_href, self.current_note_ids if note_href == self.href else set())
+            if (_tokens(child.get(_EPUB_TYPE)) & {"noteref"} or _tokens(child.get("role")) & {"doc-noteref"}) and fragment not in note_ids:
+                raise EpubSourceError("显式脚注引用没有已识别的来源定义")
+            if not parsed.scheme and not parsed.netloc and fragment in note_ids:
                 result = (
                     self.marker(child.attrib["id"], "reference")
                     if child.attrib.get("id")
                     else ""
                 )
-                return result + f"[^{note_target}]"
+                label = "".join(child.itertext()).strip()
+                if re.fullmatch(r"[\[\]()\s]*\d+[\[\]()\s]*", label):
+                    self.exclude(child)
+                else:
+                    result += self.inline(child)
+                return result + f"[^{self.target_id(fragment, note_href)}]"
             self._check_href(raw_href, rendered_href)
-            result = f"[{self.inline(child)}]({rendered_href})"
+            result = f"[{self.inline(child)}]({self.mapped_href(raw_href, rendered_href)})"
             if child.attrib.get("id"):
                 result = self.marker(child.attrib["id"], "link") + result
             return result
         if tag == "span":
             inner = self.inline(child)
-            attrs = _attrs(child)
+            attrs = self.attrs(child)
             if child.attrib.get("id"):
                 self._record(child.attrib["id"], "span")
             return f"[{inner}]{{{attrs}}}" if attrs else inner
         if tag in {"sup", "sub"}:
             class_name = "sup" if tag == "sup" else "sub"
-            return f"[{self.inline(child)}]{{.{class_name}}}"
+            return self._prefix_id(child, f"[{self.inline(child)}]{{.{class_name}}}", "inline")
         if tag in {"code", "q"}:
             return (
                 f"`{self.inline(child)}`"
@@ -672,14 +756,21 @@ class _Renderer:
         return f"{self.marker(element_id, kind)}{text}" if element_id else text
 
     def block(self, element: ET.Element) -> list[str]:
+        if id(element) in self.note_nodes:
+            return []  # Definitions are emitted once, by render_note below.
         tag = _local(element.tag)
         if tag in _SKIP_HEAD_TAGS:
+            self.exclude(element)
             return []
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             level = int(tag[1])
-            text = self.inline(element)
+            self.in_heading = True
+            try:
+                text = re.sub(r"\s+", " ", self.inline(element)).strip()
+            finally:
+                self.in_heading = False
             element_id = element.attrib.get("id")
-            suffix = f" {{#{element_id}}}" if element_id else ""
+            suffix = f" {{#{self.target_id(element_id)}}}" if element_id else ""
             if element_id:
                 self._record(element_id, "heading")
             return [f"{'#' * level} {text}{suffix}"]
@@ -689,11 +780,6 @@ class _Renderer:
         if tag in {"blockquote"}:
             return self._quote(element)
         if tag == "div" or tag in {"section", "aside", "article", "header", "footer"}:
-            if self._is_notes_container(element):
-                return []
-            classes = _tokens(element.attrib.get("class"))
-            if "quotes" in classes or "quote" in classes:
-                return self._quote(element)
             inner = self.blocks(list(element))
             mixed_text = (element.text or "").strip() or any(
                 (child.tail or "").strip() for child in list(element)
@@ -704,17 +790,17 @@ class _Renderer:
                 )
             if not inner and mixed_text:
                 inner = [self.inline(element)]
-            attrs = _attrs(element)
+            attrs = self.attrs(element)
             if not inner:
                 self._warn(f"空 div 保留为 fenced div：{element.attrib.get('id', '')}")
             if element.attrib.get("id"):
                 self._record(element.attrib["id"], "div")
-            opening = f"::: {{{attrs}}}" if attrs else ":::"
+            opening = f"::: {{{attrs}}}"
             return [opening, *inner, ":::"]
         if tag in {"ul", "ol"}:
             return self._list(element)
         if tag == "hr":
-            return ["---"]
+            return [self.marker(element.attrib["id"], "rule"), "", "---"] if element.get("id") else ["---"]
         if tag == "img":
             return [self._inline_node(element)]
         raise EpubSourceError(f"正文包含未支持的块元素：{tag}")
@@ -746,10 +832,15 @@ class _Renderer:
             if inner:
                 inner[0] = self.marker(element.attrib["id"], "quote") + inner[0]
             else:
-                self._record(element.attrib["id"], "quote")
+                inner = [self.marker(element.attrib["id"], "quote")]
         return [">" if not line else f"> {line}" for line in inner]
 
     def _list(self, element: ET.Element) -> list[str]:
+        children = list(element)
+        if children and any(id(child) in self.note_nodes for child in children):
+            if not all(id(child) in self.note_nodes for child in children):
+                raise EpubSourceError("尾注列表混合了定义与普通列表项，需研究后处理")
+            return [self.marker(element.attrib["id"], "list")] if element.get("id") else []
         ordered = _local(element.tag) == "ol"
         if ordered and element.attrib.get("start") not in {None, "1"}:
             raise EpubSourceError(
@@ -765,7 +856,7 @@ class _Renderer:
                 if child.attrib.get("id")
                 else ""
             )
-            inline_text = item_marker + _escape_text(child.text or "")
+            inline_text = item_marker + self.text(child)
             block_parts: list[list[str]] = []
             nested: list[str] = []
             for inline_child in list(child):
@@ -774,7 +865,7 @@ class _Renderer:
                     nested.extend(self._list(inline_child))
                     if (inline_child.tail or "").strip():
                         block_parts.append(
-                            [_escape_text(inline_child.tail or "").strip()]
+                            [self.text(inline_child, "tail").strip()]
                         )
                 elif child_tag in {
                     "p",
@@ -789,11 +880,11 @@ class _Renderer:
                         block_parts.append(rendered_block)
                     if (inline_child.tail or "").strip():
                         block_parts.append(
-                            [_escape_text(inline_child.tail or "").strip()]
+                            [self.text(inline_child, "tail").strip()]
                         )
                 else:
                     inline_text += self._inline_node(inline_child)
-                    inline_text += _escape_text(inline_child.tail or "")
+                    inline_text += self.text(inline_child, "tail")
             blocks: list[list[str]] = []
             if inline_text.strip():
                 blocks.append([inline_text.strip()])
@@ -824,10 +915,15 @@ class _Renderer:
             result.pop()
         return result
 
-    def _is_notes_container(self, element: ET.Element) -> bool:
-        classes = _tokens(element.attrib.get("class"))
-        epub_type = element.attrib.get("{http://www.idpf.org/2007/ops}type", "")
-        return bool(classes & _NOTE_CLASS_TOKENS) or epub_type in _NOTE_CLASS_TOKENS
+    def note_label(self, element: ET.Element, note_id: str) -> bool:
+        # A class alone does not justify deleting text. Only an explicit,
+        # numeric link to a known reference is a generated navigation label.
+        label = "".join(element.itertext()).strip()
+        links = [node for node in element.iter() if _local(node.tag) == "a"]
+        identity = _link_identity(self.href, links[0].get("href", "")) if len(links) == 1 else None
+        return ("label" in _tokens(element.get("class"))
+                and bool(re.fullmatch(r"\d+", label)) and identity is not None
+                and identity[0] == self.href and self.note_reference_ids.get(identity[1]) == note_id)
 
     def render_note(self, note: ET.Element) -> list[str]:
         note_id = note.attrib.get("id", "")
@@ -838,7 +934,7 @@ class _Renderer:
         block_children = [
             child
             for child in children
-            if "label" not in _tokens(child.attrib.get("class"))
+            if not self.note_label(child, note_id)
             and _local(child.tag)
             in {
                 "p",
@@ -849,33 +945,40 @@ class _Renderer:
                 "blockquote",
                 "ul",
                 "ol",
+                "h1", "h2", "h3", "h4", "h5", "h6",
             }
         ]
         if block_children:
             content = []
             if (note.text or "").strip():
-                content.append(_escape_text(note.text or "").strip())
+                content.append(self.text(note).strip())
             for child in children:
-                if "label" in _tokens(child.attrib.get("class")):
+                if self.note_label(child, note_id):
+                    self.exclude(child)
                     if (child.tail or "").strip():
-                        content.append(_escape_text(child.tail or "").strip())
+                        content.append(self.text(child, "tail").strip())
                     continue
-                content.extend(self.block(child))
+                if _local(child.tag) in _BLOCK_TAGS:
+                    content.extend(self.block(child))
+                else:
+                    content.append(self._inline_node(child))
                 if (child.tail or "").strip():
-                    content.append(_escape_text(child.tail or "").strip())
+                    content.append(self.text(child, "tail").strip())
         else:
-            inline_text = _escape_text(note.text or "")
+            inline_text = self.text(note)
             for child in children:
-                if "label" in _tokens(child.attrib.get("class")):
-                    inline_text += _escape_text(child.tail or "")
+                if self.note_label(child, note_id):
+                    self.exclude(child)
+                    inline_text += self.text(child, "tail")
                 else:
                     inline_text += self._inline_node(child)
-                    inline_text += _escape_text(child.tail or "")
+                    inline_text += self.text(child, "tail")
             content = [inline_text.strip()] if inline_text.strip() else []
         if not content:
             self._warn(f"空脚注定义：{note_id}")
             content = ["[]{.empty-note}"]
-        first = f"[^{note_id}]: []{{#{note_id}}}{content[0]}"
+        target_id = self.target_id(note_id)
+        first = f"[^{target_id}]: []{{#{target_id}}}{content[0]}"
         return [first, *(f"    {line}" if line else "" for line in content[1:])]
 
 
@@ -886,15 +989,37 @@ def _find_body(root: ET.Element) -> ET.Element:
     return bodies[0]
 
 
-def _find_notes_container(body: ET.Element) -> ET.Element | None:
+def _explicit_note(element: ET.Element) -> bool:
+    return bool(_tokens(element.get(_EPUB_TYPE)) & _NOTE_TYPES
+                or _tokens(element.get("role")) & _NOTE_ROLES)
+
+
+def _explicit_notes_container(element: ET.Element) -> bool:
+    return bool(_tokens(element.get(_EPUB_TYPE)) & {"footnotes", "endnotes"}
+                or _tokens(element.get("role")) & {"doc-endnotes"})
+
+
+def _linked_ids(body: ET.Element, href: str) -> set[str]:
+    result: set[str] = set()
+    for node in body.iter():
+        if _local(node.tag) == "a":
+            identity = _link_identity(href, node.get("href", ""))
+            if identity is not None and identity[0] == href:
+                result.add(identity[1])
+    return result
+
+
+def _find_notes_container(body: ET.Element, href: str) -> ET.Element | None:
+    linked = _linked_ids(body, href)
     found = [
         element
         for element in body.iter()
         if (element is not body)
         and (
-            bool(_tokens(element.attrib.get("class")) & _NOTE_CLASS_TOKENS)
-            or element.attrib.get("{http://www.idpf.org/2007/ops}type", "")
-            in _NOTE_CLASS_TOKENS
+            _explicit_notes_container(element)
+            or (bool(_tokens(element.get("class")) & _NOTE_CLASS_TOKENS)
+                and (not "".join(element.itertext()).strip()
+                     or bool(_note_nodes(element, linked))))
         )
     ]
     if len(found) > 1:
@@ -914,7 +1039,7 @@ def _collect_ids(root: ET.Element) -> set[str]:
     return ids
 
 
-def _note_nodes(container: ET.Element | None) -> list[ET.Element]:
+def _note_nodes(container: ET.Element | None, linked_ids: set[str] | None = None) -> list[ET.Element]:
     if container is None:
         return []
     result: list[ET.Element] = []
@@ -922,9 +1047,177 @@ def _note_nodes(container: ET.Element | None) -> list[ET.Element]:
         if element is container or not element.attrib.get("id"):
             continue
         classes = element.attrib.get("class", "")
-        if _NOTE_CLASS_RE.search(classes) or _NOTE_ID_RE.search(element.attrib["id"]):
+        if _explicit_note(element) or (
+            element.attrib["id"] in (linked_ids or set())
+            and (_NOTE_CLASS_RE.search(classes) or _NOTE_ID_RE.search(element.attrib["id"]))
+        ):
             result.append(element)
     return result
+
+
+def _locators(root: ET.Element) -> dict[int, str]:
+    result: dict[int, str] = {}
+
+    def visit(element: ET.Element, path: str) -> None:
+        result[id(element)] = path
+        counts: Counter[str] = Counter()
+        for child in element:
+            tag = _local(child.tag)
+            counts[tag] += 1
+            visit(child, f"{path}/{tag}[{counts[tag]}]")
+
+    visit(root, f"/{_local(root.tag)}[1]")
+    return result
+
+
+def _visible_text(element: ET.Element, excluded: set[tuple[int, str]]) -> str:
+    result = "" if (id(element), "text") in excluded else (element.text or "")
+    for child in element:
+        is_block = _local(child.tag) in _BLOCK_TAGS
+        result += ("\n" if is_block else "") + _visible_text(child, excluded)
+        result += "\n" if is_block or _local(child.tag) == "br" else ""
+        if (id(child), "tail") not in excluded:
+            result += child.tail or ""
+    return result
+
+
+def _qualified_id(href: str, source_id: str) -> str:
+    identity = json.dumps([href, source_id], ensure_ascii=False, separators=(",", ":"))
+    return "src-" + _sha256(identity.encode("utf-8"))
+
+
+def probe_epub(path: str | Path) -> tuple[EpubPackage, dict[str, object]]:
+    """Inventory every spine document before attempting conversion.
+
+    Class names are recorded as opaque source facts. Unsupported subtrees are
+    reported once at their outermost node, while tag counts include descendants.
+    The report is a routing aid, not content/visual acceptance.
+    """
+    package = read_epub(path)
+    issues: list[dict[str, object]] = []
+    units: list[dict[str, object]] = []
+    targets: dict[str, set[str]] = {}
+    roots: dict[str, ET.Element] = {}
+    with _PackageReader(package.path) as reader:
+        for item in package.manifest:
+            if item.media_type != _XHTML:
+                continue
+            try:
+                root = _parse_xml(reader.read(item.href), item.href)
+                roots[item.href] = root
+                targets[item.href] = {node.get("id", "") for node in root.iter() if node.get("id")}
+            except EpubSourceError as error:
+                issues.append({"code": "invalid_xhtml", "href": item.href,
+                               "locator": "/", "message": str(error)})
+        for item in package.spine:
+            root = roots.get(item.href)
+            facts: dict[str, object] = {"unit": item.unit, "href": item.href, "tags": {},
+                                      "classes": {}, "epub_types": {}, "roles": {},
+                                      "ids": [], "links": [], "stylesheets": [], "notes": 0}
+            units.append(facts)
+            if root is None:
+                if item.media_type != _XHTML:
+                    issues.append({"code": "unsupported_spine_media", "href": item.href,
+                                   "locator": "/", "message": item.media_type})
+                continue
+            locators = _locators(root)
+            tags: Counter[str] = Counter()
+            classes: Counter[str] = Counter()
+            types: Counter[str] = Counter()
+            roles: Counter[str] = Counter()
+            ids: set[str] = set()
+            for node in root.iter():
+                tag = _local(node.tag)
+                tags[tag] += 1
+                classes.update(_tokens(node.get("class")))
+                types.update(_tokens(node.get(_EPUB_TYPE)))
+                roles.update(_tokens(node.get("role")))
+                source_id = node.get("id")
+                if source_id:
+                    if source_id in ids:
+                        issues.append({"code": "duplicate_id", "href": item.href,
+                                       "locator": locators[id(node)], "source_id": source_id})
+                    ids.add(source_id)
+                if tag == "link" and "stylesheet" in _tokens(node.get("rel")):
+                    facts["stylesheets"].append(node.get("href", ""))
+                if tag in {"a", "img"}:
+                    raw = node.get("href" if tag == "a" else "src", "")
+                    if tag == "a" and not raw and node.get("id") and not (
+                        _tokens(node.get(_EPUB_TYPE)) & {"noteref"} or _tokens(node.get("role")) & {"doc-noteref"}
+                    ):
+                        continue  # A named anchor is not a missing hyperlink.
+                    facts["links"].append({"locator": locators[id(node)], "target": raw, "tag": tag})
+                    try:
+                        parsed = urllib.parse.urlsplit(raw)
+                        if not parsed.scheme and not parsed.netloc:
+                            if parsed.query:
+                                issues.append({"code": "unsupported_link_query", "href": item.href,
+                                    "locator": locators[id(node)], "target": raw})
+                            target = _safe_package_member(posixpath.join(posixpath.dirname(item.href),
+                                urllib.parse.unquote(parsed.path))) if parsed.path else item.href
+                            fragment = urllib.parse.unquote(parsed.fragment)
+                            if not raw or target not in package.members or (fragment and fragment not in targets.get(target, set())):
+                                issues.append({"code": "unresolved_link", "href": item.href,
+                                    "locator": locators[id(node)], "target": raw})
+                    except (ValueError, EpubSourceError) as error:
+                        issues.append({"code": "invalid_link", "href": item.href,
+                                       "locator": locators[id(node)], "message": str(error)})
+            facts.update(tags=dict(sorted(tags.items())), classes=dict(sorted(classes.items())),
+                         epub_types=dict(sorted(types.items())), roles=dict(sorted(roles.items())), ids=sorted(ids))
+            try:
+                body = _find_body(root)
+                container = _find_notes_container(body, item.href)
+                notes = _note_nodes(container, _linked_ids(body, item.href))
+                facts["notes"] = len(notes)
+                if container is not None and not notes and "".join(container.itertext()).strip():
+                    issues.append({"code": "unrecognized_notes", "href": item.href,
+                                   "locator": locators[id(container)], "message": "非空尾注容器缺少可识别的定义"})
+                note_nodes = {id(note) for note in notes}
+                for node in body.iter():
+                    if _explicit_note(node) and id(node) not in note_nodes:
+                        issues.append({"code": "unsupported_note_layout", "href": item.href,
+                            "locator": locators[id(node)], "message": "独立或嵌套的显式脚注需要先研究"})
+                if (body.text or "").strip() or any((child.tail or "").strip() for child in body):
+                    issues.append({"code": "unsupported_context", "href": item.href,
+                                   "locator": locators[id(body)], "message": "body 含直接文本"})
+
+                block_children = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section",
+                                  "aside", "article", "header", "footer", "blockquote", "ul", "ol", "hr", "img"} | _SKIP_HEAD_TAGS
+                inline_children = _SUPPORTED_TAGS - _BLOCK_TAGS - {"hr"}
+
+                def unsupported(node: ET.Element, allowed: set[str] | None = None) -> None:
+                    tag = _local(node.tag)
+                    if tag not in _SUPPORTED_TAGS:
+                        issues.append({"code": "unsupported_element", "href": item.href,
+                            "locator": locators[id(node)], "tag": tag, "source_id": node.get("id", "")})
+                        return
+                    if allowed is not None and tag not in allowed and id(node) not in note_nodes:
+                        issues.append({"code": "unsupported_context", "href": item.href,
+                            "locator": locators[id(node)], "tag": tag, "message": "元素不在支持的上下文中"})
+                    if tag == "ol" and node.get("start") not in {None, "1"} and not any(id(child) in note_nodes for child in node):
+                        issues.append({"code": "unsupported_list_start", "href": item.href,
+                                       "locator": locators[id(node)], "message": node.get("start", "")})
+                    if tag not in _SKIP_HEAD_TAGS:
+                        if id(node) in note_nodes or tag == "li":
+                            next_allowed = block_children | inline_children
+                        elif tag in {"body", "div", "section", "aside", "article", "header", "footer"}:
+                            next_allowed = block_children
+                        elif tag in {"ul", "ol"}:
+                            next_allowed = {"li"}
+                        elif tag == "blockquote":
+                            next_allowed = block_children | inline_children
+                        else:
+                            next_allowed = inline_children
+                        for child in node:
+                            unsupported(child, next_allowed)
+
+                unsupported(body)
+            except EpubSourceError as error:
+                issues.append({"code": "ambiguous_structure", "href": item.href,
+                               "locator": locators[id(root)], "message": str(error)})
+    return package, {"schema_version": 1, "source_sha256": package.source_sha256,
+                     "opf": package.opf_path, "units": units, "issues": issues,
+                     "ready_for_draft": not issues}
 
 
 _ANCHOR_ONLY_RE = re.compile(
@@ -936,7 +1229,7 @@ _FOOTNOTE_PREFIX_RE = re.compile(r"^(\s*\[\^[^\]]+\]:\s*)")
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(?:\s|$)")
 
 
-def _insert_unit_marker(lines: list[str], marker: str, warnings: list[str]) -> None:
+def _insert_unit_marker(lines: list[str], marker: str, warnings: list[str], *, prefer_heading: bool = False) -> None:
     """Insert a source-unit span without changing the first block type."""
 
     for index, line in enumerate(lines):
@@ -944,6 +1237,11 @@ def _insert_unit_marker(lines: list[str], marker: str, warnings: list[str]) -> N
         if not stripped or _ANCHOR_ONLY_RE.fullmatch(line):
             continue
         if stripped.startswith("#"):
+            if prefer_heading:
+                match = re.match(r"^#{1,6}\s+", line)
+                if match:
+                    lines[index] = line[:match.end()] + marker + line[match.end():]
+                    return
             # Heading-only front matter is handled explicitly below; when a
             # heading precedes prose, the marker belongs in that prose block.
             continue
@@ -981,9 +1279,12 @@ def _insert_unit_marker(lines: list[str], marker: str, warnings: list[str]) -> N
     )
     if heading_index is None:
         raise EpubSourceError("无法把 source-unit 放入正文首个块")
-    lines[heading_index] = lines[heading_index] + " " + marker
+    match = re.match(r"^#{1,6}\s+", lines[heading_index])
+    assert match is not None
+    line = lines[heading_index]
+    lines[heading_index] = line[:match.end()] + marker + line[match.end():]
     warnings.append(
-        "该 XHTML 只有标题块，source-unit marker 已附加到标题末尾；需人工复核"
+        "该 XHTML 只有标题块，source-unit marker 已置于标题内；需人工复核"
     )
 
 
@@ -996,11 +1297,12 @@ def _relocate_locations(
     relocated: list[SourceLocation] = []
     missing: list[str] = []
     for location in locations:
-        if _ID_RE.fullmatch(location.source_id):
-            token = re.compile(r"\{#" + re.escape(location.source_id) + r"(?=[\s}])")
+        target_id = location.target_id or location.source_id
+        if _ID_RE.fullmatch(target_id):
+            token = re.compile(r"\{#" + re.escape(target_id) + r"(?=[\s}])")
         else:
             token = re.compile(
-                r'id="' + re.escape(location.source_id.replace('"', "&quot;")) + r'"'
+                r'id="' + re.escape(target_id.replace('"', "&quot;")) + r'"'
             )
         line_number = next(
             (index for index, line in enumerate(lines, start=1) if token.search(line)),
@@ -1020,6 +1322,8 @@ def convert_xhtml(
     unit: int | None = None,
     package_targets: Mapping[str, set[str]] | None = None,
     package_members: Iterable[str] | None = None,
+    qualified_ids: Mapping[tuple[str, str], str] | None = None,
+    package_notes: Mapping[str, set[str]] | None = None,
     strict_links: bool = True,
     include_unit_marker: bool = False,
 ) -> ConversionResult:
@@ -1045,11 +1349,22 @@ def convert_xhtml(
         target_ids=targets,
         package_members=members,
         strict_links=strict_links,
+        qualified_ids=qualified_ids,
+        package_notes=package_notes,
     )
-    notes_container = _find_notes_container(body)
-    note_nodes = _note_nodes(notes_container)
+    notes_container = _find_notes_container(body, current_href)
+    note_nodes = _note_nodes(notes_container, _linked_ids(body, current_href))
+    note_node_ids = {id(note) for note in note_nodes}
+    if any(_explicit_note(node) and id(node) not in note_node_ids for node in body.iter()):
+        raise EpubSourceError("独立或嵌套的显式脚注需要先研究，不能降级为普通正文")
+    renderer.note_nodes = {id(note) for note in note_nodes}
     renderer.current_note_ids = {note.attrib["id"] for note in note_nodes}
+    renderer.note_reference_ids = {node.get("id", ""): _link_identity(current_href, node.get("href", ""))[1] for node in body.iter()
+        if _local(node.tag) == "a" and _link_identity(current_href, node.get("href", ""))
+           in {(current_href, note_id) for note_id in renderer.current_note_ids}}
     if notes_container is not None and not note_nodes:
+        if "".join(notes_container.itertext()).strip():
+            raise EpubSourceError("非空 Notes 容器缺少可识别定义，不能作为空容器输出")
         renderer._warn("空 Notes 容器已显式保留")
 
     if (body.text or "").strip() or any(
@@ -1057,17 +1372,8 @@ def convert_xhtml(
     ):
         raise EpubSourceError("body 含未支持的混合直接文本")
 
-    body_elements = [
-        element
-        for element in list(body)
-        if element is not notes_container and _local(element.tag) not in _SKIP_HEAD_TAGS
-    ]
+    body_elements = list(body)
     lines = renderer.blocks(body_elements)
-    if notes_container is not None and not note_nodes:
-        attrs = _attrs(notes_container)
-        if notes_container.attrib.get("id"):
-            renderer._record(notes_container.attrib["id"], "notes")
-        lines.extend([f"::: {{{attrs}}}" if attrs else ":::", ":::"])
     if note_nodes:
         if lines:
             lines.append("")
@@ -1076,6 +1382,15 @@ def convert_xhtml(
             lines.append("")
         while lines and lines[-1] == "":
             lines.pop()
+
+    document_id = (qualified_ids or {}).get((current_href, ""))
+    if document_id:
+        renderer._record("", "document")
+        _insert_unit_marker(lines, f"[]{{#{document_id}}}", renderer.warnings, prefer_heading=True)
+    for element in (root, body):
+        if element.get("id"):
+            marker = renderer.marker(element.attrib["id"], "document-root")
+            _insert_unit_marker(lines, marker, renderer.warnings, prefer_heading=True)
 
     if include_unit_marker:
         if unit is None:
@@ -1087,12 +1402,33 @@ def convert_xhtml(
     locations, missing_locations = _relocate_locations(markdown, renderer.locations)
     for source_id in missing_locations:
         renderer._warn(f"来源 id 未能绑定到 Markdown 锚点：{source_id}")
+    locators = _locators(body)
+    for node in body.iter():
+        for slot in ("text", "tail"):
+            if node is body and slot == "tail":
+                continue
+            key = (id(node), slot)
+            if (getattr(node, slot) or "").strip() and key not in renderer.consumed and key not in renderer.excluded:
+                raise EpubSourceError(f"来源正文文字未消费：{current_href}{locators[id(node)]}/{slot}")
+    expected_notes = {renderer.target_id(note.get("id", "")): _visible_text(note, renderer.excluded)
+                      for note in note_nodes}
+    body_exclusions = set(renderer.excluded)
+    for note in note_nodes:
+        for descendant in note.iter():
+            body_exclusions.add((id(descendant), "text"))
+            if descendant is not note:
+                body_exclusions.add((id(descendant), "tail"))
     return ConversionResult(
         unit=unit,
         href=current_href,
         markdown=markdown,
         locations=locations,
         warnings=tuple(renderer.warnings),
+        expected_text=_visible_text(body, body_exclusions),
+        expected_notes=expected_notes,
+        expected_heading_levels=tuple(int(_local(node.tag)[1]) for node in body.iter()
+            if re.fullmatch(r"h[1-6]", _local(node.tag))),
+        expected_ids=tuple(renderer.target_id(node.attrib["id"]) for node in root.iter() if node.get("id")),
     )
 
 
@@ -1114,27 +1450,24 @@ def render_epub(
         raise EpubSourceError(f"请求了不存在的 spine unit：{sorted(unknown)}")
     xhtml_items = [item for item in package.manifest if item.media_type == _XHTML]
     target_ids: dict[str, set[str]] = {}
+    roots: dict[str, ET.Element] = {}
     with _PackageReader(package.path) as reader:
         for item in xhtml_items:
             root = _parse_xml(reader.read(item.href), item.href)
+            roots[item.href] = root
             target_ids[item.href] = _collect_ids(root)
         selected_hrefs = {item.href for item in package.spine if item.unit in selected}
-        owners: dict[str, list[str]] = {}
-        for item_href in selected_hrefs:
-            for element_id in target_ids.get(item_href, set()):
-                owners.setdefault(element_id, []).append(item_href)
-        collisions = {
-            element_id: hrefs for element_id, hrefs in owners.items() if len(hrefs) > 1
-        }
-        if collisions and strict_links:
-            details = "; ".join(
-                f"{element_id} ({', '.join(sorted(hrefs))})"
-                for element_id, hrefs in sorted(collisions.items())
-            )
-            raise EpubSourceError(
-                "选定的 XHTML 合并范围含重复 fragment id，无法安全生成单入口草稿："
-                + details
-            )
+        qualified_ids = {(href, source_id): _qualified_id(href, source_id)
+                         for href in selected_hrefs for source_id in {"", *target_ids.get(href, set())}}
+        if len(set(qualified_ids.values())) != len(qualified_ids):
+            raise EpubSourceError("来源身份映射出现目标 ID 冲突")
+        package_notes: dict[str, set[str]] = {}
+        for href in selected_hrefs:
+            if href not in roots:
+                continue
+            body = _find_body(roots[href])
+            package_notes[href] = {node.attrib["id"] for node in
+                _note_nodes(_find_notes_container(body, href), _linked_ids(body, href))}
         results: list[ConversionResult] = []
         for item in package.spine:
             if item.unit not in selected:
@@ -1149,20 +1482,145 @@ def render_epub(
                 unit=item.unit,
                 package_targets=target_ids,
                 package_members=package.members,
+                qualified_ids=qualified_ids,
+                package_notes=package_notes,
                 strict_links=strict_links,
                 include_unit_marker=include_unit_marker,
             )
-            if collisions:
-                result = replace(
-                    result,
-                    warnings=(
-                        *result.warnings,
-                        "选定范围存在重复 fragment id，合并为单入口时必须先重写链接："
-                        + ", ".join(sorted(collisions)),
-                    ),
-                )
             results.append(result)
     return package, tuple(results)
+
+
+def _ast_nodes(value: object) -> Iterable[dict[str, object]]:
+    if isinstance(value, dict):
+        if "t" in value:
+            yield value
+        for child in value.values():
+            yield from _ast_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _ast_nodes(child)
+
+
+def _ast_text(value: object, *, include_notes: bool = False) -> str:
+    if isinstance(value, list):
+        return "".join(_ast_text(child, include_notes=include_notes) for child in value)
+    if not isinstance(value, dict):
+        return ""
+    tag, contents = value.get("t"), value.get("c")
+    if tag == "Str":
+        return str(contents)
+    if tag in {"Space", "SoftBreak", "LineBreak"}:
+        return " "
+    if tag in {"Code", "CodeBlock", "Math"}:
+        return str(contents[1])
+    if tag in {"RawInline", "RawBlock"}:
+        raise EpubSourceError("草稿解析出现未核对的 raw 内容")
+    if tag == "Note":
+        return _ast_text(contents, include_notes=True) if include_notes else ""
+    if tag == "Image":
+        return ""  # Alt text is metadata, not a source body text slot.
+    if tag == "Header":
+        contents = contents[2]
+    elif tag in {"Span", "Div", "Link", "Quoted"}:
+        contents = contents[1]
+    return _ast_text(contents, include_notes=include_notes)
+
+
+def _text_key(text: str) -> str:
+    # The formal reader's smart typography changes only these punctuation
+    # spellings. All other characters and their multiplicity remain checked.
+    text = text.translate(str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'}))
+    text = text.replace("…", "...").replace("—", "--").replace("–", "-")
+    return "".join(text.split())
+
+
+def verify_drafts(drafts: Sequence[ConversionResult]) -> dict[str, object]:
+    """Parse with the formal reader and reject body, note or heading loss.
+
+    The body check conserves non-whitespace characters, separately from notes
+    so repeated references cannot mask body loss. Each note also has an ordered
+    text comparison. These are machine checks, not a visual/content approval.
+    """
+    if not drafts:
+        raise EpubSourceError("没有可核对的草稿")
+    try:
+        parsed = subprocess.run(
+            ["pandoc", "-f", PANDOC_READER, "-t", "json"],
+            input="\n\n".join(draft.markdown for draft in drafts),
+            text=True, encoding="utf-8", capture_output=True, check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise EpubSourceError(f"无法运行草稿解析核对：{error}") from error
+    if parsed.returncode or parsed.stderr.strip():
+        raise EpubSourceError(f"草稿解析未通过：{parsed.stderr.strip() or parsed.returncode}")
+    try:
+        ast = json.loads(parsed.stdout)
+    except json.JSONDecodeError as error:
+        raise EpubSourceError("草稿解析器没有返回有效 JSON") from error
+    blocks = ast["blocks"]
+    nodes = list(_ast_nodes(blocks))
+    expected_body = Counter(_text_key("".join(draft.expected_text for draft in drafts)))
+    actual_body = Counter(_text_key(_ast_text(blocks)))
+    if expected_body - actual_body:
+        raise EpubSourceError("正文文字在 Markdown 解析后丢失")
+    headers = [node for node in nodes if node["t"] == "Header"]
+    expected_levels = Counter(level for draft in drafts for level in draft.expected_heading_levels)
+    if expected_levels != Counter(node["c"][0] for node in headers):
+        raise EpubSourceError("标题结构在 Markdown 解析后改变")
+    header_ids = {node["c"][1][0] for node in headers}
+    for draft in drafts:
+        for location in draft.locations:
+            if location.kind == "heading" and (location.target_id or location.source_id) not in header_ids:
+                raise EpubSourceError(f"来源标题失去原生结构：{draft.href}#{location.source_id}")
+    attr_indexes = {"Header": 1, "Span": 0, "Div": 0, "Link": 0, "Image": 0,
+                    "Code": 0, "CodeBlock": 0}
+    actual_ids = {node["c"][attr_indexes[node["t"]]][0] for node in nodes if node["t"] in attr_indexes}
+    for draft in drafts:
+        missing = set(draft.expected_ids) - actual_ids
+        if missing:
+            raise EpubSourceError(f"来源锚点在解析后丢失：{draft.href} ({len(missing)})")
+    for node in nodes:
+        if node["t"] == "Link" and node["c"][2][0].startswith("#") and node["c"][2][0][1:] not in actual_ids:
+            raise EpubSourceError("草稿中的链接没有实际目标锚点")
+    expected_notes = {key: text for draft in drafts for key, text in draft.expected_notes.items()}
+    found_notes: set[str] = set()
+    for note in (node for node in nodes if node["t"] == "Note"):
+        note_ids = {node["c"][0][0] for node in _ast_nodes(note["c"]) if node["t"] == "Span"}
+        matched = note_ids & expected_notes.keys()
+        if len(matched) != 1:
+            raise EpubSourceError("脚注结构无法绑定到唯一来源定义")
+        note_id = matched.pop()
+        if _text_key(expected_notes[note_id]) != _text_key(_ast_text(note["c"], include_notes=True)):
+            raise EpubSourceError(f"脚注正文文字在 Markdown 解析后改变：{note_id}")
+        found_notes.add(note_id)
+    if found_notes != expected_notes.keys():
+        raise EpubSourceError("脚注定义在 Markdown 解析后丢失或没有引用")
+    return {"body_text": "character_conservation", "notes": len(found_notes), "headings": len(headers)}
+
+
+def write_probe(profile: Mapping[str, object], output_dir: str | Path, *, scratch_root: str | Path) -> Path:
+    """Persist a fresh, contained intake report even when rendering is blocked."""
+    destination = _fresh_scratch_directory(output_dir, scratch_root)
+    path = destination / "profile.json"
+    path.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    return path
+
+
+def _fresh_scratch_directory(output_dir: str | Path, scratch_root: str | Path) -> Path:
+    root = Path(scratch_root).resolve()
+    requested = Path(output_dir)
+    if requested.is_symlink() or bool(getattr(requested, "is_junction", lambda: False)()):
+        raise EpubSourceError("草稿目录不能是 symlink 或 junction")
+    destination = requested.resolve()
+    try:
+        destination.relative_to(root)
+    except ValueError as error:
+        raise EpubSourceError(f"草稿目录必须位于 scratch root：{destination} -> {root}") from error
+    if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+        raise EpubSourceError(f"拒绝覆盖已有草稿目录：{destination}")
+    destination.mkdir(parents=True, exist_ok=True)
+    return destination
 
 
 def write_drafts(
@@ -1179,27 +1637,9 @@ def write_drafts(
     the two inspectable scratch artifacts required by ``source-draft``.
     """
 
-    root = Path(scratch_root).resolve()
-    requested_destination = Path(output_dir)
-    if requested_destination.is_symlink() or bool(
-        getattr(requested_destination, "is_junction", lambda: False)()
-    ):
-        raise EpubSourceError("草稿目录不能是 symlink 或 junction")
-    destination = requested_destination.resolve()
-    try:
-        destination.relative_to(root)
-    except ValueError as error:
-        raise EpubSourceError(
-            f"草稿目录必须位于 scratch root：{destination} -> {root}"
-        ) from error
-    if destination.exists():
-        if not destination.is_dir():
-            raise EpubSourceError(f"草稿目录不是目录：{destination}")
-        if any(destination.iterdir()):
-            raise EpubSourceError(f"拒绝覆盖已有草稿目录：{destination}")
-    destination.mkdir(parents=True, exist_ok=True)
     if not drafts:
         raise EpubSourceError("没有可写出的 XHTML 草稿")
+    destination = _fresh_scratch_directory(output_dir, scratch_root)
     draft_path = destination / "draft.md"
     map_path = destination / "source-map.json"
     for target in (draft_path, map_path):
@@ -1263,6 +1703,9 @@ __all__ = [
     "convert_xhtml",
     "read_epub",
     "read_source_units",
+    "probe_epub",
     "render_epub",
+    "verify_drafts",
+    "write_probe",
     "write_drafts",
 ]

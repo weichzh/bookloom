@@ -28,7 +28,7 @@
 
 没有理解主要版式前，不批量生成全书正式底稿。
 
-EPUB 初始化使用统一 `init`；无可靠页码时选择 Markdown／HTML 的 source-units 路径。需要辅助恢复时使用 `source-draft`，输出只在 `scratch`，保留原生段落、强调、标题、链接与位置；不得直接据草稿翻译或宣称核定完成。Unsupported 或 ambiguous 项先回到原生 XHTML 和可读渲染裁决，不用临时转换器静默扁平化。
+EPUB 初始化使用统一 `init`；无可靠页码时选择 Markdown／HTML 的 source-units 路径。先用 `source-probe` 完整探查来源表达方式和共享转换器的能力边界；需要辅助恢复时使用 `source-draft`，它先保存探查报告，再检查信息保全，输出只在 `scratch`。命令、映射和检查的准确范围见 `CONTRACTS.md`；不得直接据草稿翻译或宣称核定完成。Unsupported 或 ambiguous 项先回到原生 XHTML、样式依赖和可读渲染研究裁决；确认可跨书复用的能力再进入共享实现，书级判断留在该书核定记录中，不把每次临时转换都提升为主代码。
 
 ## 3. 查看原页
 

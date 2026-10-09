@@ -19,3 +19,4 @@
 | [docs/codebase/CONTRACTS.md](codebase/CONTRACTS.md) | manifest、CLI 与日志机器语义 | book, shared-change |
 | [docs/workflow/TRANSLATION.md](workflow/TRANSLATION.md) | 内容恢复、翻译与交付流程 | book |
 | [docs/workflow/EPUB.md](workflow/EPUB.md) | EPUB 生成与验收 | book, shared-change |
+| [docs/changes/epub-source-intake.md](changes/epub-source-intake.md) | 已批准的来源探查、身份映射与信息保全变更 | shared-change |
