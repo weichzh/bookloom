@@ -3,16 +3,25 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+from contextlib import contextmanager
 import html
 import json
 import locale
+import math
 import os
 import re
 import sys
 import time
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
+
+try:
+    from tools.browser_runtime import hidden_process_options
+except ModuleNotFoundError:  # direct ``python tools/gladtex_filter.py`` execution
+    from browser_runtime import hidden_process_options
 
 
 # GladTeX dimensions are CSS pixels at 12pt. These ratios target a 16px
@@ -20,6 +29,117 @@ from typing import Any
 # a readable block-level lift without changing each SVG's internal proportions.
 INLINE_MATH_EM_PER_PX = 0.06
 DISPLAY_MATH_EM_PER_PX = 0.10
+ROW_TAG_RENDER_VERSION = "translator-row-tags-v1"
+GLADTEX_MAX_WORKERS = 8
+
+# Let amsmath place each label on its own row.  The first pass only measures
+# content and labels; the second pass is the actual native align* display.
+ROW_TAG_PREAMBLE = r"""
+\makeatletter
+\newsavebox{\TranslatorMathBox}
+\newdimen\TranslatorMathWidth
+\newdimen\TranslatorTagWidth
+\NewDocumentCommand\TranslatorMeasureTag{s m}{%
+\IfBooleanTF{#1}{\setbox0=\hbox{\normalfont #2}}{\setbox0=\hbox{\normalfont (#2)}}%
+\ifdim\wd0>\TranslatorTagWidth\global\TranslatorTagWidth=\wd0\fi}
+\NewDocumentEnvironment{translatoralign}{+b}{%
+\TranslatorTagWidth=0pt
+\begingroup
+\let\dft@tag\TranslatorMeasureTag
+\sbox{\TranslatorMathBox}{$\displaystyle\begin{aligned}#1\end{aligned}$}%
+\global\TranslatorMathWidth=\wd\TranslatorMathBox
+\endgroup
+\hsize=\dimexpr\TranslatorMathWidth+\TranslatorTagWidth+2em\relax
+\linewidth=\hsize \textwidth=\hsize \columnwidth=\hsize
+\mathindent=0pt
+\abovedisplayskip=0pt \belowdisplayskip=0pt
+\abovedisplayshortskip=0pt \belowdisplayshortskip=0pt
+\begin{align*}#1\end{align*}%
+}{}
+\makeatother
+"""
+
+
+@contextmanager
+def gladtex_runtime(cachedconverter: Any, image: Any):
+    """Bound only GladTeX's pool and hide only its subprocesses."""
+    original_concurrent = cachedconverter.concurrent
+    original_subprocess = image.subprocess
+
+    def thread_pool(*, max_workers: int):
+        return concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max_workers, GLADTEX_MAX_WORKERS)
+        )
+
+    class HiddenSubprocess:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(original_subprocess, name)
+
+        def Popen(self, *args: Any, **kwargs: Any) -> Any:
+            options = hidden_process_options()
+            options.update(kwargs)
+            return original_subprocess.Popen(*args, **options)
+
+    cachedconverter.concurrent = SimpleNamespace(
+        futures=SimpleNamespace(
+            ThreadPoolExecutor=thread_pool,
+            as_completed=concurrent.futures.as_completed,
+        )
+    )
+    image.subprocess = HiddenSubprocess()
+    try:
+        yield
+    finally:
+        cachedconverter.concurrent = original_concurrent
+        image.subprocess = original_subprocess
+
+
+def row_tagged_alignment(formula: str) -> str | None:
+    """Identify the supported top-level displays without parsing their math."""
+    if len(re.findall(r"\\tag\*?\s*\{", formula)) < 2:
+        return None
+    match = re.fullmatch(
+        r"\s*\\begin\{(?P<env>align\*?|aligned)\}"
+        r"(?P<body>.*)\\end\{(?P=env)\}\s*",
+        formula,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    body = match.group("body")
+    if match.group("env") == "aligned":
+        # This is the subordinate environment's vertical-position option,
+        # not a leading mathematical bracket in the native align* body.
+        body = re.sub(r"^\s*\[[tbc]\]", "", body, count=1)
+    return body
+
+
+def native_tagged_display(formula: str) -> str | None:
+    """Use native AMS handling for multi-row or formatted/starred labels."""
+    body = row_tagged_alignment(formula)
+    if body is not None:
+        return body
+    if not re.search(r"\\tag\*\s*\{|\\tag\s*\{[^{}]*\{", formula):
+        return None
+    match = re.fullmatch(
+        r"\s*\\begin\{(?P<env>equation\*?|align\*?|aligned)\}"
+        r"(?P<body>.*)\\end\{(?P=env)\}\s*", formula, re.DOTALL,
+    )
+    if not match:
+        return None
+    body = match.group("body")
+    if match.group("env") == "aligned":
+        body = re.sub(r"^\s*\[[tbc]\]", "", body, count=1)
+    return body
+
+
+def normalize_display_input(formula: str) -> str:
+    """Normalize only the rendering copy, not the source AST or alt text."""
+    for old, new in (("rm", "mathrm"), ("bf", "mathbf"), ("it", "mathit")):
+        formula = re.sub(
+            r"\\" + old + r"\b", lambda _m, replacement=new: "\\" + replacement, formula
+        )
+    return re.sub(r"\n(?:[ \t]*\n)+", "\n", formula)
 
 
 def relative_formula_style(element: ET.Element, em_per_px: float) -> None:
@@ -177,7 +297,7 @@ def math_nodes(value: Any) -> list[tuple[str, bool]]:
     return formulas
 
 
-def valid_svg(path: Path) -> bool:
+def valid_svg(path: Path, *, require_row_tags: bool = False) -> bool:
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError):
@@ -185,6 +305,31 @@ def valid_svg(path: Path) -> bool:
     return (
         root.tag == "{http://www.w3.org/2000/svg}svg"
         and len(root.attrib.get("viewBox", "").split()) == 4
+        and (
+            not require_row_tags
+            or any(
+                node.tag == "{http://www.w3.org/2000/svg}metadata"
+                and node.text == ROW_TAG_RENDER_VERSION
+                for node in root.iter()
+            )
+        )
+    )
+
+
+def valid_partial_row_tag_svg(path: Path) -> bool:
+    """Reject malformed geometric bounds before stamping a partial result."""
+    if not valid_svg(path):
+        return False
+    try:
+        root = ET.parse(path).getroot()
+        view_box = [float(value) for value in root.attrib["viewBox"].split()]
+    except (OSError, KeyError, ValueError, ET.ParseError):
+        return False
+    return (
+        len(view_box) == 4
+        and all(math.isfinite(value) for value in view_box)
+        and view_box[2] > 0
+        and view_box[3] > 0
     )
 
 
@@ -226,7 +371,10 @@ def cache_statistics(
             except ValueError:
                 pass
             else:
-                valid = valid_svg(candidate)
+                valid = valid_svg(
+                    candidate,
+                    require_row_tags=display and native_tagged_display(formula) is not None,
+                )
         if valid:
             hits += 1
             continue
@@ -250,6 +398,71 @@ def cache_statistics(
     return hits, len(unique) - hits
 
 
+def stamp_row_tag_svgs(
+    cache_path: Path,
+    working_directory: Path,
+    formulas: list[tuple[str, bool]],
+    normalize_formula: Any,
+    *,
+    partial: bool = False,
+) -> None:
+    """Version valid current-input row-tag images, optionally after failure."""
+    affected = {
+        normalize_formula(formula)
+        for formula, display in formulas
+        if display and native_tagged_display(formula) is not None
+    }
+    if not affected or (partial and not cache_path.exists()):
+        return
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    for formula in affected:
+        try:
+            relative = cache[formula]["true"]["path"]
+            if not isinstance(relative, str):
+                raise TypeError("row-tag cache image path must be a string")
+            path = (working_directory / relative).resolve()
+            path.relative_to(cache_path.parent.resolve())
+            if not valid_svg(path) or (partial and not valid_partial_row_tag_svg(path)):
+                raise ValueError(f"Row-tag rendering produced invalid SVG: {path}")
+        except (KeyError, TypeError, ValueError):
+            if partial:
+                continue
+            raise
+        if valid_svg(path, require_row_tags=True):
+            continue
+        tree = ET.parse(path)
+        metadata = ET.SubElement(tree.getroot(), "{http://www.w3.org/2000/svg}metadata")
+        metadata.text = ROW_TAG_RENDER_VERSION
+        ET.register_namespace("", "http://www.w3.org/2000/svg")
+        ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+
+
+def run_gladtex_with_checkpoint(
+    main: Any,
+    arguments: list[str],
+    cachedconverter: Any,
+    image: Any,
+    cache_path: Path,
+    working_directory: Path,
+    formulas: list[tuple[str, bool]],
+    normalize_formula: Any,
+) -> None:
+    """Preserve GladTeX's exception while checkpointing finished row tags."""
+    try:
+        with gladtex_runtime(cachedconverter, image):
+            main.run(arguments)
+    except BaseException:
+        try:
+            stamp_row_tag_svgs(
+                cache_path, working_directory, formulas, normalize_formula,
+                partial=True,
+            )
+        except BaseException as error:  # noqa: BLE001 - checkpoint and re-raise the original failure
+            print(f"WARNING: GladTeX partial row-tag checkpoint failed: {error}", file=sys.stderr)
+        raise
+
+
 def main() -> int:
     if len(sys.argv) != 4:
         raise SystemExit(
@@ -264,6 +477,7 @@ def main() -> int:
     # GladTeX 3.1.0 rejects UTF-8 under non-Western Windows locales.
     locale.getdefaultlocale = lambda: ("en_US", "UTF-8")  # type: ignore[assignment]
 
+    from gleetex import cachedconverter, image
     from gleetex.__main__ import Main
     from gleetex.cachedconverter import CachedConverter
     from gleetex.caching import ImageCache, normalize_formula
@@ -311,6 +525,16 @@ def main() -> int:
     def compact_display(document: LaTeXDocument, enabled: bool) -> None:
         formula = document._LaTeXDocument__equation  # type: ignore[attr-defined]
         if enabled:
+            row_body = native_tagged_display(formula)
+            if row_body is not None:
+                # GladTeX strips trailing whitespace before appending its end
+                # environment.  Terminate a possible final TeX comment first.
+                document._LaTeXDocument__equation = (  # type: ignore[attr-defined]
+                    normalize_display_input(row_body).rstrip() + "\n\\relax"
+                )
+                document.set_latex_environment("translatoralign")
+                original_display(document, False)
+                return
             equation = re.fullmatch(
                 r"\s*\\begin\{equation\*?\}(.*)\\end\{equation\*?\}\s*",
                 formula,
@@ -332,9 +556,7 @@ def main() -> int:
             # ``\rm`` in GladTeX's scrartcl preamble.  Pandoc can emit these
             # aliases when normalizing \mathrm/\mathbf/\mathit; canonicalize
             # them before GladTeX compiles the formula.
-            formula = re.sub(r"\\rm\b", r"\\mathrm", formula)
-            formula = re.sub(r"\\bf\b", r"\\mathbf", formula)
-            formula = re.sub(r"\\it\b", r"\\mathit", formula)
+            formula = normalize_display_input(formula)
             tags = re.findall(r"\\tag\{([^{}]+)\}", formula)
             formula = re.sub(r"\s*\\tag\{[^{}]+\}\s*", " ", formula)
             formula = re.sub(r"\n(?:[ \t]*\n)+", "\n", formula)
@@ -369,7 +591,8 @@ def main() -> int:
     LaTeXDocument.set_displaymath = compact_display
     ImageCache.write = atomic_cache_write
 
-    Main().run(
+    run_gladtex_with_checkpoint(
+        Main(),
         [
             "gladtex",
             "-P",
@@ -385,13 +608,26 @@ def main() -> int:
             (
                 r"\usepackage{CJKutf8}"
                 r"\usepackage{mathrsfs}"
+                r"\usepackage{bbm}"
+                + ROW_TAG_PREAMBLE
+                +
                 r"\AtBeginDocument{\begin{CJK}{UTF8}{gbsn}}"
                 r"\AtEndDocument{\end{CJK}}"
             ),
             "-o",
             output_path.name,
             input_path.name,
-        ]
+        ],
+        cachedconverter,
+        image,
+        cache_path,
+        input_path.parent,
+        math_nodes(source_document),
+        normalize_formula,
+    )
+
+    stamp_row_tag_svgs(
+        cache_path, input_path.parent, math_nodes(source_document), normalize_formula
     )
 
     document = json.loads(output_path.read_text(encoding="utf-8"))

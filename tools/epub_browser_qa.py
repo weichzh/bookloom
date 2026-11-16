@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run isolated agent-browser QA against every XHTML in an EPUB."""
+"""Run isolated agent-browser QA against selected or all XHTML in an EPUB."""
 
 from __future__ import annotations
 
@@ -12,9 +12,29 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from typing import Any
+
+try:
+    from tools import browser_runtime
+    from tools.epub_semantics import (
+        CODE_DOM_EXTRACTOR_JS,
+        CodeRecord,
+        EpubSemanticError,
+        code_from_xhtml,
+        validate_code_records,
+    )
+except ModuleNotFoundError:  # Direct execution: python tools/epub_browser_qa.py
+    import browser_runtime
+    from epub_semantics import (
+        CODE_DOM_EXTRACTOR_JS,
+        CodeRecord,
+        EpubSemanticError,
+        code_from_xhtml,
+        validate_code_records,
+    )
 
 ROOT = Path(__file__).resolve().parents[1]
 KNOWN_VIEWPORT_EOF = "EOF while parsing a value"
@@ -121,18 +141,49 @@ HARNESS = r"""<!doctype html>
 <iframe id="reader" title="EPUB QA"></iframe>
 <script>
   const pages = __PAGES__;
+  const allPages = __ALL_PAGES__;
   const pageTimeout = __PAGE_TIMEOUT__;
   const expectedViewport = [__WIDTH__, __HEIGHT__];
   const modeSettings = __MODE_SETTINGS__;
+  const extractCode = __CODE_DOM_EXTRACTOR__;
   const state = (window.qaState = { done: false, results: [], errors: [] });
   const frame = document.querySelector("#reader");
   let pageReaderSettings = null;
+  const formulaMetrics = new WeakMap();
 
   function applyReaderMode(document) {
     const publisherNodes = [
       ...document.querySelectorAll("link[rel~='stylesheet'], style"),
     ];
     const inlineStyleNodes = [...document.querySelectorAll("[style]")];
+    const formulaRules = [];
+    if (modeSettings.disable_publisher_css) {
+      const emNumber = (value, positive) => {
+        if (!/^[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)em$/.test(value)) return null;
+        const number = Number(value.slice(0, -2));
+        return Number.isFinite(number) && (!positive || number > 0) ? number : null;
+      };
+      const images = [...document.querySelectorAll("img.math-inline, img.math-display")];
+      images.forEach((image, index) => {
+        if (!formulaMetrics.has(image)) {
+          let width = emNumber(image.style.width, true);
+          const height = emNumber(image.style.height, true);
+          if (width === null && height !== null && image.naturalHeight > 0) {
+            width = height * image.naturalWidth / image.naturalHeight;
+          }
+          formulaMetrics.set(image, width > 0 && Number.isFinite(width)
+            ? { width, baseline: emNumber(image.style.verticalAlign, false) } : null);
+        }
+        const metrics = formulaMetrics.get(image);
+        if (!metrics) return;
+        image.setAttribute("data-qa-math-size", String(index));
+        const baseline = metrics.baseline === null
+          ? "" : `vertical-align: ${metrics.baseline}em !important;`;
+        formulaRules.push(
+          `img[data-qa-math-size="${index}"] { width: ${metrics.width}em !important; ${baseline} }`,
+        );
+      });
+    }
     let removedPublisherStyleCount = 0;
     let removedInlineStyleCount = 0;
     if (modeSettings.disable_publisher_css) {
@@ -158,9 +209,27 @@ HARNESS = r"""<!doctype html>
     }
     if (modeSettings.disable_publisher_css) {
       rules.push(
-        "html, body, body * { overflow-wrap: anywhere !important; word-break: break-word !important; }",
+        "html, body, body * { overflow-wrap: anywhere !important; word-break: break-word !important; text-spacing-trim: space-all !important; }",
+        "img, svg { max-width: 100% !important; height: auto !important; }",
+        ".display-formula { display: block !important; max-width: 100% !important; overflow-x: auto !important; text-indent: 0 !important; }",
+        ".display-formula img.math-display { max-width: none !important; }",
+        "pre { max-width: 100% !important; overflow-x: auto !important; }",
+        "table { display: block !important; max-width: 100% !important; overflow-x: auto !important; }",
+        "table, table * { overflow-wrap: normal !important; word-break: keep-all !important; }",
+        ".table-scroll .table-token { white-space: nowrap !important; }",
+        ".table-scroll table img.math-inline, .table-scroll table img.math-display { max-width: none !important; }",
+        "table th, table td { padding-inline: 0.25em !important; }",
+        ".code-table th:first-child, .code-table td:first-child { min-width: 4em !important; }",
+        ".code-table th:first-child, .code-table td:first-child, .code-table th:first-child *, .code-table td:first-child * { overflow-wrap: normal !important; word-break: normal !important; }",
+        "@counter-style translator-decimal-two-parens { system: extends decimal; prefix: '('; suffix: ') '; }",
+        "div.translator-list-decimal-two-parens > ol > li { list-style-type: translator-decimal-two-parens; }",
+        "pre, pre *, code, code *, .code-example .line-block, .code-example .line-block *, .binding-example .line-block, .binding-example .line-block * { font-family: monospace !important; }",
+        ".code-example, .binding-example, .code-table { max-width: 100% !important; overflow-x: auto !important; }",
+        ".code-example .line-block, .binding-example .line-block { white-space: nowrap !important; }",
+        ".code-example code, .binding-example code, .code-table code { white-space: pre !important; }",
       );
     }
+    rules.push(...formulaRules);
     if (rules.length) {
       override = document.createElement("style");
       override.id = "qa-reader-overrides";
@@ -184,6 +253,7 @@ HARNESS = r"""<!doctype html>
       publisherCssDisabled: modeSettings.disable_publisher_css
         ? remainingPublisherNodes === 0 && remainingInlineStyleNodes === 0
         : false,
+      mathImagesWithRelativeSizing: formulaRules.length,
       publisherStyleNodesBefore: publisherNodes.length,
       publisherStyleNodesRemoved: removedPublisherStyleCount,
       publisherStyleNodesRemaining: remainingPublisherNodes,
@@ -207,22 +277,180 @@ HARNESS = r"""<!doctype html>
       reflowWrapApplied: modeSettings.disable_publisher_css
         ? ["anywhere", "break-word"].includes(computedBody.overflowWrap)
         : false,
+      actualTextSpacingTrim: computedBody.textSpacingTrim,
+      fullwidthPunctuationApplied: modeSettings.disable_publisher_css
+        ? computedBody.textSpacingTrim === "space-all"
+        : false,
+      mediaFittingApplied: modeSettings.disable_publisher_css
+        ? [...document.querySelectorAll("img, svg")].filter(
+            (node) => !(node.matches("img.math-display") && node.closest(".display-formula"))
+              && !node.matches(".table-scroll table img.math-inline, .table-scroll table img.math-display"),
+          ).every(
+            (node) => getComputedStyle(node).maxWidth === "100%",
+          )
+        : false,
+      mathDisplayScrollingApplied: modeSettings.disable_publisher_css
+        ? [...document.querySelectorAll(".display-formula img.math-display")].every(
+            (node) => {
+              const container = getComputedStyle(node.closest(".display-formula"));
+              return getComputedStyle(node).maxWidth === "none"
+                && container.maxWidth === "100%"
+                && container.display === "block" && container.overflowX === "auto";
+            },
+          )
+        : false,
+      tableMathScrollingApplied: modeSettings.disable_publisher_css
+        ? [...document.querySelectorAll(
+            ".table-scroll table img.math-inline, .table-scroll table img.math-display",
+          )].every((node) => {
+            const table = getComputedStyle(node.closest("table"));
+            return getComputedStyle(node).maxWidth === "none"
+              && table.maxWidth === "100%" && table.overflowX === "auto";
+          })
+        : false,
+      codeScrollingApplied: modeSettings.disable_publisher_css
+        ? [...document.querySelectorAll("pre, .code-example, .binding-example, .code-table")].every(
+            (node) => getComputedStyle(node).maxWidth === "100%"
+              && getComputedStyle(node).overflowX === "auto",
+          ) && [...document.querySelectorAll(
+            ".code-example .line-block, .binding-example .line-block",
+          )].every((node) => getComputedStyle(node).whiteSpace === "nowrap")
+          && [...document.querySelectorAll(
+            ".code-example code, .binding-example code, .code-table code",
+          )].every((node) => getComputedStyle(node).whiteSpace === "pre")
+          && [...document.querySelectorAll(
+            "pre, code, .code-example .line-block, .binding-example .line-block",
+          )].every((node) => getComputedStyle(node).fontFamily === "monospace")
+        : false,
     };
   }
 
-  function loadPage(path) {
+  const documentCache = new Map();
+
+  function documentUrl(url) {
+    const value = new URL(url, window.location.href);
+    value.hash = "";
+    value.pathname = decodeURIComponent(value.pathname).split("/")
+      .map((part, index) => value.protocol === "file:" && index === 1 && /^[a-z]:$/i.test(part)
+        ? part : encodeURIComponent(part)).join("/");
+    return new URL(value.href).href;
+  }
+
+  const packageDocuments = new Set(allPages.map((path) => documentUrl(path)));
+
+  function linkIdentity(url, base) {
+    const value = new URL(url, base);
+    const member = documentUrl(value.href);
+    const fragment = decodedFragment(value.href);
+    if (!packageDocuments.has(member) || value.search || !fragment) return null;
+    return { member, fragment };
+  }
+
+  async function loadPage(path) {
+    const requested = new URL(path, window.location.href);
+    const fragment = decodedFragment(requested.href);
+    if (fragment && frame.contentDocument?.readyState === "complete"
+        && documentUrl(frame.contentWindow.location.href) === documentUrl(requested.href)) {
+      frame.contentWindow.location.hash = requested.hash;
+      pageReaderSettings = applyReaderMode(frame.contentDocument);
+      if (!(await positionFragment(fragment))?.visible) {
+        throw new Error(`fragment not visible after reader layout: ${fragment}`);
+      }
+      return;
+    }
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error(`timeout ${path}`)), pageTimeout);
-      frame.onload = () => {
+      const loaded = async () => {
         clearTimeout(timeout);
         try {
+          if (!frame.contentDocument) {
+            throw new Error(`cannot access local XHTML ${path}; check file-origin launch arguments`);
+          }
           pageReaderSettings = applyReaderMode(frame.contentDocument);
+          const fragment = decodedFragment(frame.contentWindow.location.href);
+          if (fragment && !(await positionFragment(fragment))?.visible) {
+            throw new Error(`fragment not visible after reader layout: ${fragment}`);
+          }
+          documentCache.set(documentUrl(frame.contentWindow.location.href),
+            frame.contentDocument.cloneNode(true));
           resolve();
         } catch (error) {
           reject(error);
         }
       };
+      const timeout = setTimeout(() => {
+        frame.removeEventListener("load", loaded);
+        reject(new Error(`timeout ${path}`));
+      }, pageTimeout);
+      frame.addEventListener("load", loaded, { once: true });
       frame.src = path;
+    });
+  }
+
+  async function targetDocument(member) {
+    if (!documentCache.has(member)) await loadPage(member);
+    return documentCache.get(member);
+  }
+
+  function fragmentPosition(element) {
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = frame.contentDocument.documentElement.clientHeight;
+    return { top: rect.top, bottom: rect.bottom, viewportHeight,
+      visible: rect.top < viewportHeight && rect.bottom >= 0 };
+  }
+
+  async function positionFragment(fragment) {
+    const document = frame.contentDocument;
+    const target = document.getElementById(fragment);
+    if (!target) return null;
+    // The browser's initial hash scroll precedes reader font/style overrides.
+    // Re-anchor the same verified target only after its final layout is ready.
+    if (document.fonts) await document.fonts.ready;
+    target.scrollIntoView({ block: "start", inline: "nearest", behavior: "instant" });
+    const rect = target.getBoundingClientRect();
+    if (rect.height === 0) {
+      // Empty pagebreak anchors can round a fractional top just above the viewport.
+      // Move to a real in-viewport coordinate; keep the visibility test exact.
+      frame.contentWindow.scrollTo({
+        top: Math.floor(frame.contentWindow.scrollY + rect.top),
+        left: frame.contentWindow.scrollX, behavior: "instant",
+      });
+    }
+    await new Promise((resolve) => frame.contentWindow.requestAnimationFrame(resolve));
+    return fragmentPosition(target);
+  }
+
+  function clickNavigation(anchor, expected) {
+    const previous = frame.contentDocument;
+    const crossesDocument = documentUrl(frame.contentWindow.location.href) !== expected.member;
+    return new Promise((resolve) => {
+      let loaded = false;
+      const onload = () => { loaded = true; };
+      const started = Date.now();
+      const finish = async (success) => {
+        clearInterval(timer);
+        frame.removeEventListener("load", onload);
+        try {
+          if (success) {
+            pageReaderSettings = applyReaderMode(frame.contentDocument);
+            success = Boolean((await positionFragment(expected.fragment))?.visible);
+          }
+          resolve(success);
+        } catch (_) {
+          resolve(false);
+        }
+      };
+      frame.addEventListener("load", onload);
+      const timer = setInterval(() => {
+        const actual = linkIdentity(frame.contentWindow.location.href, window.location.href);
+        const ready = frame.contentDocument && frame.contentDocument.readyState === "complete";
+        if (actual && actual.member === expected.member && actual.fragment === expected.fragment
+            && ready && (!crossesDocument || (loaded && frame.contentDocument !== previous))) {
+          finish(Boolean(frame.contentDocument.getElementById(expected.fragment)));
+        } else if (Date.now() - started >= pageTimeout) {
+          finish(false);
+        }
+      }, 20);
+      anchor.click();
     });
   }
 
@@ -240,7 +468,8 @@ HARNESS = r"""<!doctype html>
     }
   }
 
-  function verifyFootnoteNavigation(document) {
+  async function verifyFootnoteNavigation(document) {
+    const sourceMember = documentUrl(frame.contentWindow.location.href);
     let noterefTargetChecks = 0;
     let backlinkTargetChecks = 0;
     let noterefTargetFailures = 0;
@@ -250,47 +479,67 @@ HARNESS = r"""<!doctype html>
     let noterefNavigationFailures = 0;
     let backlinkNavigationFailures = 0;
     const validPairs = [];
-    for (const reference of [...document.querySelectorAll("a")]
-      .filter((element) => hasEpubType(element, "noteref"))) {
+    const footnoteNavigation = [];
+    const references = [...document.querySelectorAll("a")]
+      .filter((element) => hasEpubType(element, "noteref"));
+    for (const reference of references) {
       noterefTargetChecks += 1;
-      const targetUrl = new URL(reference.getAttribute("href"), document.baseURI);
-      const targetId = decodedFragment(targetUrl.href);
-      const target = targetId && document.getElementById(targetId);
-      if (!target) {
+      const targetLink = linkIdentity(reference.getAttribute("href"), sourceMember);
+      const targetRoot = targetLink && await targetDocument(targetLink.member);
+      const target = targetRoot && targetRoot.getElementById(targetLink.fragment);
+      if (!reference.id || references.filter((item) => item.id === reference.id).length !== 1
+          || !target || [...targetRoot.querySelectorAll("[id]")]
+            .filter((item) => item.id === targetLink.fragment).length !== 1
+          || target.localName !== "aside"
+          || !hasEpubType(target, "footnote")) {
         noterefTargetFailures += 1;
         continue;
       }
-      const backlink = [...target.querySelectorAll("a")]
-        .find((element) => hasEpubType(element, "backlink")
-          && decodedFragment(new URL(
-            element.getAttribute("href"), document.baseURI
-          ).href) === reference.id);
+      const backlink = [...target.querySelectorAll("a")].find((element) => {
+        if (!hasEpubType(element, "backlink")) return false;
+        const link = linkIdentity(element.getAttribute("href"), targetLink.member);
+        return link && link.member === sourceMember && link.fragment === reference.id;
+      });
       backlinkTargetChecks += 1;
       if (!backlink) {
         backlinkTargetFailures += 1;
         continue;
       }
-      validPairs.push({ reference, targetId, backlink });
+      // Store identities, not DOM nodes: cross-file navigation replaces the document.
+      validPairs.push({ referenceId: reference.id, targetLink });
     }
+    if (documentUrl(frame.contentWindow.location.href) !== sourceMember) await loadPage(sourceMember);
     const samples = validPairs.length <= 3 ? validPairs : [
       validPairs[0],
       validPairs[Math.floor((validPairs.length - 1) / 2)],
       validPairs[validPairs.length - 1],
     ];
-    for (const { reference, targetId, backlink } of samples) {
-      noterefNavigationChecks += 1;
-      reference.click();
-      if (decodedFragment(frame.contentWindow.location.href) !== targetId) {
-        noterefNavigationFailures += 1;
-        continue;
-      }
-      backlinkNavigationChecks += 1;
-      const backlinkUrl = new URL(backlink.getAttribute("href"), document.baseURI);
-      const backlinkId = decodedFragment(backlinkUrl.href);
-      backlink.click();
-      if (!backlinkId || !document.getElementById(backlinkId)
-          || decodedFragment(frame.contentWindow.location.href) !== backlinkId) {
-        backlinkNavigationFailures += 1;
+    for (const { referenceId, targetLink } of samples) {
+      try {
+        const reference = frame.contentDocument.getElementById(referenceId);
+        noterefNavigationChecks += 1;
+        if (!reference || !await clickNavigation(reference, targetLink)) {
+          noterefNavigationFailures += 1;
+          continue;
+        }
+        const target = frame.contentDocument.getElementById(targetLink.fragment);
+        const targetPosition = fragmentPosition(target);
+        const backlink = target && [...target.querySelectorAll("a")].find((element) => {
+          const link = hasEpubType(element, "backlink")
+            && linkIdentity(element.getAttribute("href"), targetLink.member);
+          return link && link.member === sourceMember && link.fragment === referenceId;
+        });
+        backlinkNavigationChecks += 1;
+        if (!backlink || !await clickNavigation(backlink, { member: sourceMember, fragment: referenceId })) {
+          backlinkNavigationFailures += 1;
+        } else {
+          footnoteNavigation.push({ source: sourceMember, referenceId,
+            target: targetLink.member, targetId: targetLink.fragment, targetPosition,
+            returned: documentUrl(frame.contentWindow.location.href),
+            returnPosition: fragmentPosition(frame.contentDocument.getElementById(referenceId)) });
+        }
+      } finally {
+        if (documentUrl(frame.contentWindow.location.href) !== sourceMember) await loadPage(sourceMember);
       }
     }
     return {
@@ -302,17 +551,18 @@ HARNESS = r"""<!doctype html>
       backlinkNavigationChecks,
       noterefNavigationFailures,
       backlinkNavigationFailures,
+      footnoteNavigation,
     };
   }
 
-  function inspect(path, verifyNavigation = true) {
+  async function inspect(path, verifyNavigation = true) {
+    const navigation = verifyNavigation ? await verifyFootnoteNavigation(frame.contentDocument) : {};
     const document = frame.contentDocument;
     const viewport = document.documentElement.clientWidth;
     const images = [...document.images];
     const formulas = [...document.querySelectorAll("img.math-inline,img.math-display")];
     const documentScrollWidth = document.documentElement.scrollWidth;
     const bodyScrollWidth = document.body.scrollWidth;
-    const navigation = verifyNavigation ? verifyFootnoteNavigation(document) : {};
     const identifiers = [...document.querySelectorAll("[id]")]
       .map((element) => element.id);
     const internalLinks = [...document.querySelectorAll("a[href]")]
@@ -321,7 +571,7 @@ HARNESS = r"""<!doctype html>
         if (url.protocol !== "file:" || !/\.x?html$/i.test(url.pathname)) return null;
         return {
           href: element.getAttribute("href"),
-          target: url.href.replace(/#.*$/, ""),
+          target: documentUrl(url.href),
           fragment: decodedFragment(url.href),
         };
       })
@@ -351,13 +601,14 @@ HARNESS = r"""<!doctype html>
       : [];
     return {
       path,
-      url: frame.contentWindow.location.href.replace(/#.*$/, ""),
+      url: documentUrl(frame.contentWindow.location.href),
       identifiers,
       internalLinks,
       viewport: [frame.contentWindow.innerWidth, frame.contentWindow.innerHeight],
       documentScrollWidth,
       bodyScrollWidth,
       textLength: (document.body.textContent || "").trim().length,
+      codeRecords: extractCode(document),
       imageCount: images.length,
       brokenImages: images.filter((image) => !image.complete || image.naturalWidth === 0).length,
       formulaCount: formulas.length,
@@ -365,6 +616,9 @@ HARNESS = r"""<!doctype html>
       mathmlCount: document.querySelectorAll("math").length,
       texAnnotationCount: document.querySelectorAll('[type="application/x-tex"]').length,
       tableCount: document.querySelectorAll("table").length,
+      tableMathImageCount: document.querySelectorAll(
+        ".table-scroll table img.math-inline, .table-scroll table img.math-display",
+      ).length,
       footnoteRefCount: [...document.querySelectorAll("a")]
         .filter((element) => hasEpubType(element, "noteref")).length,
       footnoteCount: [...document.querySelectorAll("aside")]
@@ -377,15 +631,31 @@ HARNESS = r"""<!doctype html>
     };
   }
 
-  function validateLinks() {
+  async function validateLinks() {
     const documents = new Map(
       state.results.map((item) => [item.url, new Set(item.identifiers)])
     );
+    // An inspected XHTML can link to a non-inspected XHTML. Resolve that
+    // target from the full extracted package without counting it as a rendered
+    // inspection; the footnote verifier uses the same package-wide identity.
+    for (const item of state.results) {
+      for (const link of item.internalLinks) {
+        if (documents.has(link.target) || !packageDocuments.has(link.target)) continue;
+        try {
+          const target = await targetDocument(link.target);
+          documents.set(link.target, target
+            ? new Set([...target.querySelectorAll("[id]")].map((node) => node.id))
+            : null);
+        } catch (_) {
+          documents.set(link.target, null);
+        }
+      }
+    }
     for (const item of state.results) {
       item.xhtmlLinkCount = item.internalLinks.length;
       item.fragmentLinkCount = item.internalLinks.filter((link) => link.fragment).length;
       item.missingXhtmlTargets = item.internalLinks
-        .filter((link) => !documents.has(link.target)).length;
+        .filter((link) => !documents.get(link.target)).length;
       item.missingFragmentTargets = item.internalLinks
         .filter((link) => {
           const identifiers = documents.get(link.target);
@@ -402,7 +672,9 @@ HARNESS = r"""<!doctype html>
     const target = [...document.querySelectorAll("a")].find(
       (element) => hasEpubType(element, "noteref")
     ) || document.querySelector("table, img.math-inline, img.math-display, h1, img");
-    if (target) target.scrollIntoView({ block: "center" });
+    if (target && !decodedFragment(new URL(path, window.location.href).href)) {
+      target.scrollIntoView({ block: "center" });
+    }
     return inspect(path, false);
   };
 
@@ -420,12 +692,12 @@ HARNESS = r"""<!doctype html>
     for (const page of pages) {
       try {
         await loadPage(page);
-        state.results.push(inspect(page));
+        state.results.push(await inspect(page));
       } catch (error) {
         state.errors.push(`${page}: ${String(error)}`);
       }
     }
-    validateLinks();
+    await validateLinks();
     state.done = true;
   }
 
@@ -466,6 +738,29 @@ def safe_extract(epub: Path, destination: Path) -> list[str]:
     return sorted(name for name in names if name.lower().endswith(".xhtml"))
 
 
+def select_members(available: list[str], selected: list[str] | None) -> list[str]:
+    if selected is None:
+        return list(available)
+    if not isinstance(selected, list) or not selected:
+        raise BrowserQAError("--member 必须包含至少一个包内 XHTML 路径")
+    if any(
+        not isinstance(member, str)
+        or not member.strip()
+        or "\\" in member
+        or posixpath.isabs(member)
+        or posixpath.normpath(member) != member
+        for member in selected
+    ):
+        raise BrowserQAError("--member 必须是规范的包内 XHTML 路径")
+    if len(set(selected)) != len(selected):
+        raise BrowserQAError("--member 不可重复")
+    unknown = [member for member in selected if member not in available]
+    if unknown:
+        raise BrowserQAError("未知 XHTML --member：" + ", ".join(unknown))
+    chosen = set(selected)
+    return [member for member in available if member in chosen]
+
+
 def write_harness(
     path: Path,
     members: list[str],
@@ -475,8 +770,11 @@ def write_harness(
     mode_settings: dict[str, Any] | None = None,
     *,
     base_prefix: str = "../",
+    available_members: list[str] | None = None,
 ) -> list[str]:
     paths = [base_prefix + member for member in members]
+    all_members = available_members if available_members is not None else members
+    all_paths = [base_prefix + member for member in all_members]
     settings = mode_settings or mode_definition(
         PUBLISHER_MODE,
         width=width,
@@ -488,10 +786,12 @@ def write_harness(
     )
     text = (
         HARNESS.replace("__PAGES__", json.dumps(paths, ensure_ascii=False))
+        .replace("__ALL_PAGES__", json.dumps(all_paths, ensure_ascii=False))
         .replace("__WIDTH__", str(width))
         .replace("__HEIGHT__", str(height))
         .replace("__PAGE_TIMEOUT__", str(page_timeout * 1000))
         .replace("__MODE_SETTINGS__", json.dumps(settings, ensure_ascii=False))
+        .replace("__CODE_DOM_EXTRACTOR__", CODE_DOM_EXTRACTOR_JS)
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -521,37 +821,20 @@ def run_agent(
     timeout: int = 30,
     check: bool = True,
     capture: bool = True,
+    scratch: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    environment["AGENT_BROWSER_HEADED"] = "false"
-    temp_path = (ROOT / ".tmp" / "translator").resolve()
-    temp_path.mkdir(parents=True, exist_ok=True)
-    project_temp = str(temp_path)
-    environment["TEMP"] = project_temp
-    environment["TMP"] = project_temp
-    browser = environment.get("TRANSLATOR_AGENT_BROWSER", "agent-browser")
     for attempt in range(3):
-        output = {"capture_output": True} if capture else {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        result = subprocess.run(
-            [
-                browser,
-                "--namespace",
+        try:
+            result = browser_runtime.run_agent(
                 namespace,
-                "--session",
                 session,
-                *arguments,
-            ],
-            cwd=ROOT,
-            env=environment,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            check=False,
-            **output,
-        )
+                arguments,
+                timeout=timeout,
+                capture=capture,
+                scratch=scratch,
+            )
+        except RuntimeError as error:
+            raise BrowserQAError(str(error)) from error
         detail = (result.stdout or "") + (result.stderr or "")
         if result.returncode and "Failed to connect" in detail and attempt < 2:
             time.sleep(1)
@@ -569,6 +852,8 @@ def result_failures(
     width: int,
     height: int,
     mode_settings: dict[str, Any] | None = None,
+    *,
+    expected_code: dict[str, tuple[CodeRecord, ...]] | None = None,
 ) -> list[str]:
     failures = [str(item) for item in state.get("errors", [])]
     results = state.get("results", [])
@@ -580,6 +865,15 @@ def result_failures(
         failures.append("未检查 XHTML：" + ", ".join(missing))
     for item in results:
         path = item.get("path", "unknown")
+        if expected_code is not None and path in expected_code:
+            actual_code = item.get("codeRecords")
+            if not isinstance(actual_code, list):
+                failures.append(f"{path}: codeRecords 缺失或不是列表")
+            else:
+                try:
+                    validate_code_records(expected_code[path], actual_code)
+                except (EpubSemanticError, KeyError, TypeError, AttributeError) as error:
+                    failures.append(f"{path}: codeRecords 保全失败：{error}")
         if item.get("viewport") != [width, height]:
             failures.append(f"{path}: viewport={item.get('viewport')}")
         for field in (
@@ -632,6 +926,31 @@ def result_failures(
                 "reflowWrapApplied"
             ):
                 failures.append(f"{path}: reflowWrapApplied=false")
+            if mode_settings.get("disable_publisher_css") and (
+                actual.get("actualTextSpacingTrim") != "space-all"
+                or not actual.get("fullwidthPunctuationApplied")
+            ):
+                failures.append(f"{path}: fullwidthPunctuationApplied=false")
+            if mode_settings.get("disable_publisher_css") and not actual.get(
+                "mediaFittingApplied"
+            ):
+                failures.append(f"{path}: mediaFittingApplied=false")
+            if mode_settings.get("disable_publisher_css") and not actual.get(
+                "codeScrollingApplied"
+            ):
+                failures.append(f"{path}: codeScrollingApplied=false")
+            if (
+                mode_settings.get("disable_publisher_css")
+                and item.get("formulaCount", 0) > 0
+                and not actual.get("mathDisplayScrollingApplied")
+            ):
+                failures.append(f"{path}: mathDisplayScrollingApplied=false")
+            if (
+                mode_settings.get("disable_publisher_css")
+                and item.get("tableMathImageCount", 0) > 0
+                and not actual.get("tableMathScrollingApplied")
+            ):
+                failures.append(f"{path}: tableMathScrollingApplied=false")
     return failures
 
 
@@ -657,6 +976,32 @@ def screenshot_paths(state: dict[str, Any], maximum: int) -> list[str]:
     return chosen
 
 
+def failure_screenshot_paths(
+    state: dict[str, Any],
+    expected: list[str],
+    width: int,
+    height: int,
+    mode_settings: dict[str, Any],
+    expected_code: dict[str, tuple[CodeRecord, ...]],
+    maximum: int,
+) -> list[str]:
+    if maximum <= 0:
+        return []
+    chosen: list[str] = []
+    for item in state.get("results", []):
+        path = item.get("path")
+        if not path or path not in expected or path in chosen:
+            continue
+        if result_failures(
+            {"results": [item]}, [path], width, height, mode_settings,
+            expected_code=expected_code,
+        ):
+            chosen.append(path)
+            if len(chosen) >= maximum:
+                break
+    return chosen
+
+
 def write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -675,6 +1020,7 @@ def mode_summary(payload: dict[str, Any]) -> list[str]:
         f"viewport={payload['viewport'][0]}x{payload['viewport'][1]}",
         f"xhtml_count={payload['xhtml_count']}",
         f"formula_count={payload['formula_count']}",
+        f"code_block_count={payload['code_block_count']}",
         f"xhtml_link_count={payload['xhtml_link_count']}",
         f"fragment_link_count={payload['fragment_link_count']}",
         f"noteref_target_checks={payload['noteref_target_checks']}",
@@ -707,6 +1053,8 @@ def run_mode(
     timeout: int,
     page_timeout: int,
     screenshots: int,
+    available_members: list[str] | None = None,
+    screenshot_policy: str = "failures",
 ) -> dict[str, Any]:
     mode = str(mode_settings["name"])
     width, height = (int(value) for value in mode_settings["viewport"])
@@ -721,18 +1069,28 @@ def run_mode(
         page_timeout,
         mode_settings,
         base_prefix="../unpacked/",
+        available_members=available_members,
     )
+    try:
+        expected_code = {
+            path: code_from_xhtml([ET.parse(unpacked / member).getroot()])
+            for path, member in zip(expected, members)
+        }
+    except (ET.ParseError, EpubSemanticError) as error:
+        raise BrowserQAError(f"浏览器代码核对基准无效：{error}") from error
     session = f"epub-{digest[:10].lower()}-{os.getpid()}-{mode}-{time.time_ns() % 1_000_000}"
     events: dict[str, Any] = {
         "namespace": namespace,
         "session": session,
         "launch_timeout_recovered": False,
         "close_timeouts": 0,
+        "close_errors": [],
         "cleanup_required": False,
         "poll_timeouts": 0,
         "viewport_command_eof": False,
         "media_command": None,
         "close_returncode": None,
+        "runtime_dir": str((mode_dir / "runtime").resolve()),
     }
     write_json(
         mode_dir / "run.json",
@@ -763,6 +1121,7 @@ def run_mode(
                 ],
                 timeout=45,
                 capture=False,
+                scratch=mode_dir / "runtime",
             )
         except subprocess.TimeoutExpired:
             ping = run_agent(
@@ -834,7 +1193,13 @@ def run_mode(
 
         screenshots_dir = mode_dir / "screenshots"
         screenshots_dir.mkdir()
-        for index, path in enumerate(screenshot_paths(state, screenshots), 1):
+        if screenshot_policy == "representative":
+            paths = screenshot_paths(state, screenshots)
+        else:
+            paths = failure_screenshot_paths(
+                state, expected, width, height, mode_settings, expected_code, screenshots
+            )
+        for index, path in enumerate(paths, 1):
             try:
                 run_agent(
                     namespace,
@@ -861,8 +1226,9 @@ def run_mode(
                     check=False,
                     capture=False,
                 )
-            except (OSError, subprocess.TimeoutExpired):
+            except (BrowserQAError, OSError, subprocess.TimeoutExpired) as error:
                 events["close_timeouts"] += 1
+                events["close_errors"].append(str(error))
                 continue
             events["close_returncode"] = closed.returncode
             if not closed.returncode:
@@ -872,7 +1238,10 @@ def run_mode(
     if state is None:
         state = {"errors": [], "results": []}
     failures = (
-        result_failures(state, expected, width, height, mode_settings)
+        result_failures(
+            state, expected, width, height, mode_settings,
+            expected_code=expected_code,
+        )
         + screenshot_errors
     )
     if run_error:
@@ -888,6 +1257,7 @@ def run_mode(
         None,
     )
     results = state.get("results", [])
+    observed_paths = {item.get("path") for item in results} & set(expected)
     payload: dict[str, Any] = {
         "epub": str(epub.resolve()),
         "sha256": digest,
@@ -895,8 +1265,11 @@ def run_mode(
         "settings": mode_settings,
         "actual_settings": actual_settings,
         "viewport": [width, height],
-        "xhtml_count": len(expected),
+        "xhtml_count": len(observed_paths),
         "formula_count": sum(item.get("formulaCount", 0) for item in results),
+        "code_block_count": sum(
+            len(expected_code[path]) for path in observed_paths
+        ),
         "xhtml_link_count": sum(item.get("xhtmlLinkCount", 0) for item in results),
         "fragment_link_count": sum(
             item.get("fragmentLinkCount", 0) for item in results
@@ -934,27 +1307,41 @@ def run_browser_qa(
     page_timeout: int = 30,
     screenshots: int = 6,
     mode: str = ALL_MODES,
+    selected_members: list[str] | None = None,
+    screenshot_policy: str = "failures",
 ) -> dict[str, Any]:
     if not epub.is_file():
         raise BrowserQAError(f"EPUB 不存在：{epub}")
     if min(width, height, timeout, page_timeout) <= 0 or screenshots < 0:
         raise BrowserQAError("viewport、超时必须为正数，截图数量不能为负数")
+    if screenshot_policy not in {"failures", "representative"}:
+        raise BrowserQAError("未知截图策略：" + str(screenshot_policy))
     if evidence.exists():
         raise BrowserQAError(f"证据目录已经存在：{evidence}")
     modes = selected_modes(mode, width=width, height=height)
     evidence.mkdir(parents=True)
     unpacked = evidence / "unpacked"
     try:
-        members = safe_extract(epub, unpacked)
+        available = safe_extract(epub, unpacked)
+        if not available:
+            raise BrowserQAError("EPUB 不含 XHTML")
+        members = select_members(available, selected_members)
     except (BrowserQAError, OSError, zipfile.BadZipFile) as error:
         (evidence / "error.txt").write_text(str(error) + "\n", encoding="utf-8")
         if isinstance(error, BrowserQAError):
             raise
         raise BrowserQAError(str(error)) from error
-    if not members:
-        error = BrowserQAError("EPUB 不含 XHTML")
-        (evidence / "error.txt").write_text(str(error) + "\n", encoding="utf-8")
-        raise error
+    selected_set = set(members)
+    coverage = {
+        "kind": "full" if selected_members is None else "selected",
+        "available_members": available,
+        "selected_members": members,
+        "unselected_members": [
+            member for member in available if member not in selected_set
+        ],
+        "checked_members": [],
+        "unchecked_members": available,
+    }
     digest = sha256(epub)
     project_key = hashlib.sha256(str(ROOT).encode("utf-8")).hexdigest()[:12]
     namespace = f"translator-{project_key}"
@@ -963,6 +1350,7 @@ def run_browser_qa(
         "sha256": digest,
         "mode": mode,
         "namespace": namespace,
+        "coverage": coverage,
         "modes": [
             {
                 "name": item["name"],
@@ -990,6 +1378,8 @@ def run_browser_qa(
             timeout=timeout,
             page_timeout=page_timeout,
             screenshots=screenshots,
+            available_members=available,
+            screenshot_policy=screenshot_policy,
         )
         mode_payloads.append(payload)
         write_json(
@@ -1008,28 +1398,53 @@ def run_browser_qa(
         for item in mode_payloads
         for failure in item["failures"]
     ]
+    paths_to_members = {"../unpacked/" + member: member for member in members}
+    checked_by_mode = [
+        [
+            paths_to_members[result["path"]]
+            for result in item["results"]
+            if result.get("path") in paths_to_members
+        ]
+        for item in mode_payloads
+    ]
+    checked_in_all = set(members)
+    for checked in checked_by_mode:
+        checked_in_all.intersection_update(checked)
+    coverage = {
+        **coverage,
+        "checked_members": [member for member in available if member in checked_in_all],
+        "unchecked_members": [
+            member for member in available if member not in checked_in_all
+        ],
+    }
+    run_record["coverage"] = coverage
+    write_json(evidence / "run.json", run_record)
     mode_records = [
         {
-            key: item[key]
-            for key in (
-                "mode",
-                "settings",
-                "sha256",
-                "actual_settings",
-                "viewport",
-                "xhtml_count",
-                "formula_count",
-                "xhtml_link_count",
-                "fragment_link_count",
-                "noteref_target_checks",
-                "backlink_target_checks",
-                "noteref_navigation_checks",
-                "backlink_navigation_checks",
-                "failures",
-                "events",
-            )
+            **{
+                key: item[key]
+                for key in (
+                    "mode",
+                    "settings",
+                    "sha256",
+                    "actual_settings",
+                    "viewport",
+                    "xhtml_count",
+                    "formula_count",
+                    "code_block_count",
+                    "xhtml_link_count",
+                    "fragment_link_count",
+                    "noteref_target_checks",
+                    "backlink_target_checks",
+                    "noteref_navigation_checks",
+                    "backlink_navigation_checks",
+                    "failures",
+                    "events",
+                )
+            },
+            "checked_members": checked,
         }
-        for item in mode_payloads
+        for item, checked in zip(mode_payloads, checked_by_mode)
     ]
     payload: dict[str, Any] = {
         "epub": str(epub.resolve()),
@@ -1037,8 +1452,9 @@ def run_browser_qa(
         "mode": mode,
         "namespace": namespace,
         "mode_count": len(mode_payloads),
-        "xhtml_count": len(members),
-        "total_xhtml_checks": len(members) * len(mode_payloads),
+        "xhtml_count": len(coverage["checked_members"]),
+        "total_xhtml_checks": sum(item["xhtml_count"] for item in mode_payloads),
+        "coverage": coverage,
         "failures": failures,
         "modes": mode_records,
         "sessions": [item["events"]["session"] for item in mode_payloads],
@@ -1049,7 +1465,7 @@ def run_browser_qa(
         f"sha256={digest}",
         f"mode={mode}",
         f"mode_count={len(mode_payloads)}",
-        f"xhtml_count_per_mode={len(members)}",
+        f"xhtml_count_per_mode={payload['xhtml_count']}",
         f"total_xhtml_checks={payload['total_xhtml_checks']}",
         f"failures={len(failures)}",
     ]
@@ -1074,6 +1490,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--page-timeout", type=int, default=30)
     parser.add_argument("--screenshots", type=int, default=6)
     parser.add_argument(
+        "--screenshot-policy", choices=("failures", "representative"), default="failures"
+    )
+    parser.add_argument(
+        "--member", action="append", dest="members", help="精确的包内 XHTML 路径；可重复"
+    )
+    parser.add_argument(
         "--mode",
         choices=(ALL_MODES, *DEFAULT_MODE_NAMES),
         default=ALL_MODES,
@@ -1090,6 +1512,8 @@ def main(argv: list[str] | None = None) -> int:
             page_timeout=args.page_timeout,
             screenshots=args.screenshots,
             mode=args.mode,
+            selected_members=args.members,
+            screenshot_policy=args.screenshot_policy,
         )
     except BrowserQAError as error:
         print(f"ERROR: {error}", file=sys.stderr)

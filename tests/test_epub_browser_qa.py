@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -65,11 +67,65 @@ class BrowserQAMatrixTests(unittest.TestCase):
 
         self.assertEqual(paths, ["../unpacked/EPUB/a.xhtml"])
         self.assertNotIn("__MODE_SETTINGS__", text)
+        self.assertNotIn("__CODE_DOM_EXTRACTOR__", text)
+        self.assertIn("codeRecords: extractCode(document)", text)
+        self.assertIn("const richSelector = '.code-example, .binding-example';", text)
         self.assertIn("publisherCssDisabled", text)
         self.assertIn("userFontSizeApplied", text)
         self.assertIn("overflow-wrap: anywhere", text)
+        self.assertIn(
+            "img, svg { max-width: 100% !important; height: auto !important; }", text
+        )
+        self.assertIn("mediaFittingApplied", text)
+        self.assertIn("table th, table td { padding-inline: 0.25em !important; }", text)
+        self.assertIn(".code-table th:first-child, .code-table td:first-child { min-width: 4em !important; }", text)
+        self.assertIn(".code-table th:first-child, .code-table td:first-child, .code-table th:first-child *, .code-table td:first-child * { overflow-wrap: normal !important; word-break: normal !important; }", text)
+        self.assertIn("table, table * { overflow-wrap: normal !important; word-break: keep-all !important; }", text)
+        self.assertIn(
+            "table { display: block !important; max-width: 100% !important; overflow-x: auto !important; }",
+            text,
+        )
+        self.assertIn(
+            "pre { max-width: 100% !important; overflow-x: auto !important; }", text
+        )
+        self.assertIn("codeScrollingApplied", text)
+        self.assertIn("font-family: monospace !important", text)
+        self.assertIn('getComputedStyle(node).fontFamily === "monospace"', text)
+        self.assertIn('querySelectorAll("pre, .code-example, .binding-example, .code-table")', text)
+        self.assertIn('getComputedStyle(node).whiteSpace === "nowrap"', text)
+        self.assertIn('getComputedStyle(node).whiteSpace === "pre"', text)
+        self.assertIn(".code-example, .binding-example, .code-table { max-width: 100% !important; overflow-x: auto !important; }", text)
+        self.assertIn(".code-example .line-block, .binding-example .line-block { white-space: nowrap !important; }", text)
+        self.assertIn(".code-example code, .binding-example code, .code-table code { white-space: pre !important; }", text)
         self.assertIn("link[rel~='stylesheet'], style", text)
         self.assertNotIn("overflow-x: hidden", text)
+
+    def test_large_print_requires_media_fitting_and_still_rejects_overflow(self) -> None:
+        result = {
+            "path": "a.xhtml",
+            "viewport": [390, 844],
+            "readerSettings": {
+                "actualColorScheme": "light",
+                "publisherCssDisabled": True,
+                "userFontApplied": True,
+                "userFontSizeApplied": True,
+                "reflowWrapApplied": True,
+                "mediaFittingApplied": False,
+                "codeScrollingApplied": False,
+            },
+            "overflowCount": 1,
+            "overflowWidth": 5,
+        }
+        failures = epub_browser_qa.result_failures(
+            {"errors": [], "results": [result]},
+            ["a.xhtml"],
+            390,
+            844,
+            epub_browser_qa.default_modes()[2],
+        )
+        self.assertTrue(any("mediaFittingApplied=false" in item for item in failures))
+        self.assertTrue(any("codeScrollingApplied=false" in item for item in failures))
+        self.assertTrue(any("overflowCount=1" in item for item in failures))
 
     def _write_epub(self, path: Path) -> None:
         xhtml = (
@@ -167,6 +223,10 @@ class BrowserQAMatrixTests(unittest.TestCase):
                         "userFontApplied": large,
                         "userFontSizeApplied": large,
                         "reflowWrapApplied": large,
+                        "fullwidthPunctuationApplied": large,
+                        "actualTextSpacingTrim": "space-all" if large else "normal",
+                        "mediaFittingApplied": large,
+                        "codeScrollingApplied": large,
                     }
                     results = [
                         {
@@ -175,6 +235,7 @@ class BrowserQAMatrixTests(unittest.TestCase):
                             "viewport": list(state["viewport"]),
                             "readerSettings": reader,
                             "formulaCount": 0,
+                            "codeRecords": [],
                             "brokenImages": 0,
                             "formulasWithoutAlt": 0,
                             "mathmlCount": 0,
@@ -275,6 +336,76 @@ class BrowserQAMatrixTests(unittest.TestCase):
 
             self.assertTrue(payload["modes"][0]["events"]["viewport_command_eof"])
             self.assertEqual(payload["failures"], [])
+
+    def _code_gate_fixture(self):
+        root = ET.fromstring(
+            '<html><body><pre>  (f x)\n  "a\u00a0b"</pre>'
+            '<div class="code-example"><div class="line-block">'
+            '<code>(f </code><span class="code-change"><code>x</code></span>'
+            '<code>)</code><br/><code>  y</code></div></div></body></html>'
+        )
+        records = epub_browser_qa.code_from_xhtml([root])
+        actual = json.loads(json.dumps([dataclasses.asdict(item) for item in records]))
+        item = {"path": "a.xhtml", "viewport": [390, 844], "codeRecords": actual}
+        return records, item
+
+    def test_code_dom_gate_compares_full_text_inventory_and_highlight_ranges(self) -> None:
+        expected, valid = self._code_gate_fixture()
+        self.assertEqual(
+            epub_browser_qa.result_failures(
+                {"results": [valid]}, ["a.xhtml"], 390, 844,
+                expected_code={"a.xhtml": expected},
+            ), []
+        )
+        for mutation in ("drop", "add", "indent", "nbsp", "highlight", "missing"):
+            with self.subTest(mutation=mutation):
+                item = json.loads(json.dumps(valid))
+                records = item["codeRecords"]
+                if mutation == "drop":
+                    records.pop()
+                elif mutation == "add":
+                    records.append(records[0])
+                elif mutation == "indent":
+                    records[0]["text"] = records[0]["text"][1:]
+                elif mutation == "nbsp":
+                    records[0]["text"] = records[0]["text"].replace("\u00a0", " ")
+                elif mutation == "highlight":
+                    records[1]["spans"] = [
+                        span for span in records[1]["spans"]
+                        if span["classes"] != ["code-change"]
+                    ]
+                else:
+                    item.pop("codeRecords")
+                failures = epub_browser_qa.result_failures(
+                    {"results": [item]}, ["a.xhtml"], 390, 844,
+                    expected_code={"a.xhtml": expected},
+                )
+                self.assertTrue(any("codeRecords" in failure for failure in failures))
+
+    def test_real_run_mode_rejects_missing_dom_code_field_even_without_code(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT / ".tmp") as directory:
+            root = Path(directory)
+            epub = root / "book.epub"
+            self._write_epub(epub)
+            fake = self._fake_runner([])
+
+            def runner(namespace, session, arguments, **kwargs):
+                result = fake(namespace, session, arguments, **kwargs)
+                if arguments == ["eval", "qaState"]:
+                    state = json.loads(result.stdout)
+                    for item in state["results"]:
+                        item.pop("codeRecords")
+                    result.stdout = json.dumps(state)
+                return result
+
+            with (
+                mock.patch.object(epub_browser_qa, "run_agent", side_effect=runner),
+                self.assertRaisesRegex(epub_browser_qa.BrowserQAError, "codeRecords"),
+            ):
+                epub_browser_qa.run_browser_qa(
+                    epub, root / "evidence", timeout=1, page_timeout=1,
+                    screenshots=0, mode=epub_browser_qa.PUBLISHER_MODE,
+                )
 
 
 if __name__ == "__main__":

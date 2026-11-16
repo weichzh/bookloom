@@ -23,6 +23,18 @@ h3 {
   line-height: 1.25;
 }
 
+img,
+svg {
+  max-width: 100%;
+  height: auto;
+}
+
+table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
 blockquote {
   margin-inline: 2rem;
 }
@@ -55,7 +67,200 @@ blockquote {
 .line-block {
   width: fit-content;
   margin-inline: auto;
+}
+
+.verse {
   white-space: pre-line;
+}
+
+.line-block {
+  white-space: normal;
+}
+
+code,
+pre,
+.code-example .line-block,
+.binding-example .line-block {
+  font-family: "Cascadia Mono", "Sarasa Mono SC", "Noto Sans Mono CJK SC",
+    "Courier New", monospace;
+  font-variant-ligatures: none;
+}
+
+pre {
+  box-sizing: border-box;
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+pre code {
+  white-space: inherit;
+  overflow-wrap: normal;
+}
+
+div.sourceCode {
+  max-width: 100%;
+}
+
+pre.text {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.code-example,
+.binding-example {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.code-example .line-block,
+.binding-example .line-block {
+  width: auto;
+  max-width: 100%;
+  margin-inline: 0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.code-example code,
+.binding-example code {
+  white-space: pre;
+}
+
+.roman {
+  font-style: normal;
+}
+
+.binding-example .binding-context {
+  color: #a3211b;
+  text-decoration: underline solid;
+  text-underline-offset: 0.2em;
+}
+
+.binding-example .binding-macro {
+  color: #005ea8;
+  text-decoration: underline double;
+  text-underline-offset: 0.2em;
+}
+
+.code-change {
+  color: #171b1d;
+  background: #fff18a;
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+}
+
+.type-subject,
+.source-highlight-green {
+  color: #103821;
+  background: #b8e7c5;
+  text-decoration: underline solid;
+  text-underline-offset: 0.2em;
+}
+
+.type-context,
+.source-highlight-blue {
+  color: #082e60;
+  background: #bddaff;
+  text-decoration: underline double;
+  text-underline-offset: 0.2em;
+}
+
+.type-result,
+.source-highlight-yellow {
+  color: #171b1d;
+  background: #fff18a;
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+}
+
+.type-extension,
+.source-highlight-purple {
+  color: #4c195e;
+  background: #ead0f4;
+  text-decoration: underline dashed;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-red {
+  color: #681e1e;
+  background: #fbd0cc;
+  text-decoration: underline wavy;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-pink {
+  color: #65224d;
+  background: #f6d3e8;
+  text-decoration: underline dotted;
+  text-decoration-thickness: 0.14em;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-orange {
+  color: #653000;
+  background: #ffddb0;
+  text-decoration: underline solid;
+  text-decoration-thickness: 0.14em;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-green > code,
+.source-highlight-blue > code,
+.source-highlight-yellow > code,
+.source-highlight-purple > code,
+.source-highlight-red > code,
+.source-highlight-pink > code,
+.source-highlight-orange > code,
+.type-subject > code,
+.type-context > code,
+.type-result > code,
+.type-extension > code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+
+@media (prefers-color-scheme: dark) {
+  .source-highlight-orange {
+    color: #ffdaa6;
+    background: #563500;
+  }
+  .source-highlight-pink {
+    color: #ffd0ea;
+    background: #52263e;
+  }
+  .source-highlight-red {
+    color: #ffb6ae;
+    background: #56252a;
+  }
+  .type-subject,
+  .source-highlight-green {
+    color: #c0f2d4;
+    background: #153f30;
+  }
+
+  .type-context,
+  .source-highlight-blue {
+    color: #a9dcff;
+    background: #17384f;
+  }
+
+  .type-result,
+  .source-highlight-yellow {
+    color: #fff3b0;
+    background: #6b5700;
+  }
+
+  .type-extension,
+  .source-highlight-purple {
+    color: #efcbff;
+    background: #46264e;
+  }
 }
 
 @media print {

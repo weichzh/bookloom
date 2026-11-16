@@ -39,3 +39,6 @@
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Mis-expanded Windows tool cache (never a project artifact)
+/%SystemDrive%/

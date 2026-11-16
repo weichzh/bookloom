@@ -27,6 +27,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Self
 
+try:
+    from tools.browser_runtime import run_hidden
+except ModuleNotFoundError:  # direct CLI import
+    from browser_runtime import run_hidden
 PANDOC_READER = "markdown+fenced_divs+bracketed_spans+footnotes-raw_html"
 SOURCE_UNITS_HEADER = (
     "unit_id",
@@ -1545,7 +1549,7 @@ def verify_drafts(drafts: Sequence[ConversionResult]) -> dict[str, object]:
     if not drafts:
         raise EpubSourceError("没有可核对的草稿")
     try:
-        parsed = subprocess.run(
+        parsed = run_hidden(
             ["pandoc", "-f", PANDOC_READER, "-t", "json"],
             input="\n\n".join(draft.markdown for draft in drafts),
             text=True, encoding="utf-8", capture_output=True, check=False, timeout=30,

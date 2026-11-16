@@ -259,18 +259,18 @@ class TranslatorTests(unittest.TestCase):
         )
         problems = translator.epub_structure_problems(root)
         self.assertIn("列表项目被解析成普通段落", problems)
-        self.assertIn("自动图注未移除：图 1.1 示例", problems)
+        self.assertNotIn("自动图注未移除：图 1.1 示例", problems)
         self.assertIn("图注重复：图 1.1 示例", problems)
 
-    def test_remove_redundant_figure_caption(self) -> None:
+    def test_equal_alt_and_caption_is_one_visible_caption(self) -> None:
         root = ET.fromstring(
             '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
             '<figure><img alt="图 1.1 示例"/><figcaption>图 1.1 示例</figcaption></figure>'
             '<figure><img alt="图 1.2 示例"/><figcaption>另一条说明</figcaption></figure>'
             '</body></html>'
         )
-        self.assertEqual(translator.remove_redundant_figure_captions(root), 1)
-        self.assertEqual(len(root.findall(".//{http://www.w3.org/1999/xhtml}figcaption")), 1)
+        self.assertEqual(translator.epub_structure_problems(root), [])
+        self.assertEqual(len(root.findall(".//{http://www.w3.org/1999/xhtml}figcaption")), 2)
 
     def test_source_image_closure_uses_embedded_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -523,7 +523,11 @@ class TranslatorTests(unittest.TestCase):
             def build(_args: object) -> int:
                 order.append("build")
                 for target, output in outputs.items():
-                    output.write_bytes(target.encode())
+                    if target == "epub":
+                        with zipfile.ZipFile(output, "w") as archive:
+                            archive.writestr("EPUB/a.xhtml", "<html/>")
+                    else:
+                        output.write_bytes(target.encode())
                 return 0
 
             def qa(_args: object) -> int:
@@ -1579,8 +1583,8 @@ class TranslatorTests(unittest.TestCase):
                 mock.patch.object(translator, "load_command_work", return_value=work),
                 mock.patch.object(
                     translator,
-                    "run",
-                    side_effect=lambda command: calls.append(command),
+                    "autocorrect_markdown",
+                    side_effect=lambda path, fix: calls.append((path, fix)),
                 ),
                 mock.patch.object(
                     translator,
@@ -1592,8 +1596,8 @@ class TranslatorTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ["autocorrect", "--fix", str(entry)],
-                    ["autocorrect", "--lint", str(entry)],
+                    (entry, True),
+                    (entry, False),
                     "check",
                 ],
             )
@@ -2304,11 +2308,18 @@ class TranslatorTests(unittest.TestCase):
 
     def test_browser_qa_launch_does_not_capture_daemon_pipes(self) -> None:
         completed = subprocess.CompletedProcess(["agent-browser"], 0)
-        with mock.patch.object(
-            epub_browser_qa.subprocess, "run", return_value=completed
-        ) as run:
-            with mock.patch.dict(
-                os.environ, {"TRANSLATOR_AGENT_BROWSER": "custom-browser"}
+        runtime = epub_browser_qa.browser_runtime
+        with tempfile.TemporaryDirectory(dir=translator.REPO_ROOT / ".tmp") as directory:
+            with (
+                mock.patch.dict(os.environ, {"TRANSLATOR_AGENT_BROWSER": "custom-browser"}),
+                mock.patch.object(runtime, "resolve_agent_browser", return_value=Path("custom-browser")) as resolve,
+            ):
+                session = runtime.AgentBrowserSession("translator-test", "qa", root=Path(directory))
+            self.assertEqual(resolve.call_args.args[0]["TRANSLATOR_AGENT_BROWSER"], "custom-browser")
+            with (
+                mock.patch.dict(runtime._SESSIONS, {("translator-test", "qa"): session}, clear=True),
+                mock.patch.object(session, "start"),
+                mock.patch.object(runtime.subprocess, "run", return_value=completed) as run,
             ):
                 epub_browser_qa.run_agent(
                     "translator-test", "qa", ["open", "about:blank"], capture=False
@@ -2391,9 +2402,21 @@ class TranslatorTests(unittest.TestCase):
             r"color:\s*(#[0-9a-fA-F]{6})",
             re.DOTALL,
         )
+        binding_pattern = re.compile(
+            r"\.binding-example \.binding-(?:context|macro)\s*\{\s*"
+            r"color:\s*(#[0-9a-fA-F]{6})"
+        )
+        for theme in (light_css, dark_css):
+            self.assertEqual(len(binding_pattern.findall(theme)), 2)
         palettes = (
-            (token_pattern.findall(light_css), "#f3f6f7"),
-            (token_pattern.findall(dark_css), "#182226"),
+            (
+                token_pattern.findall(light_css) + binding_pattern.findall(light_css),
+                "#f3f6f7",
+            ),
+            (
+                token_pattern.findall(dark_css) + binding_pattern.findall(dark_css),
+                "#182226",
+            ),
         )
 
         def luminance(color: str) -> float:
@@ -2413,6 +2436,26 @@ class TranslatorTests(unittest.TestCase):
                     min(foreground_luminance, background_luminance) + 0.05
                 )
                 self.assertGreaterEqual(ratio, 4.5, color)
+        for theme in (light_css, dark_css):
+            match = re.search(
+                r"\.code-change\s*\{\s*color:\s*(#[0-9a-fA-F]{6});\s*"
+                r"background:\s*(#[0-9a-fA-F]{6})",
+                theme,
+            )
+            self.assertIsNotNone(match)
+            values = [luminance(color) for color in match.groups()]
+            self.assertGreaterEqual((max(values) + 0.05) / (min(values) + 0.05), 4.5)
+            highlighted = re.findall(
+                r"\.source-highlight-(?:green|blue|yellow|purple|red|pink|orange)\s*\{\s*"
+                r"color:\s*(#[0-9a-fA-F]{6});\s*background:\s*(#[0-9a-fA-F]{6})",
+                theme,
+            )
+            self.assertEqual(len(highlighted), 7)
+            for foreground, background in highlighted:
+                values = [luminance(color) for color in (foreground, background)]
+                self.assertGreaterEqual(
+                    (max(values) + 0.05) / (min(values) + 0.05), 4.5
+                )
         self.assertIn("img.math-inline", css)
         self.assertIn("img.math-display", css)
         self.assertNotRegex(css, r"img\.math-inline\s*\{[^}]*width:\s*auto")
@@ -2420,12 +2463,22 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("background: #fff", light_css)
         self.assertIn("background: #182226", dark_css)
         self.assertRegex(css, r"a\.uri\s*\{[^}]*overflow-wrap:\s*anywhere")
-        self.assertRegex(css, r"pre\s*\{[^}]*overflow-wrap:\s*anywhere")
+        self.assertRegex(css, r"pre\s*\{[^}]*overflow-wrap:\s*normal")
+        self.assertRegex(css, r"pre\s*\{[^}]*white-space:\s*pre;")
+        self.assertRegex(css, r"pre\s*\{[^}]*overflow-x:\s*auto")
         self.assertRegex(css, r":not\(pre\) > code\s*\{[^}]*overflow-wrap:\s*anywhere")
         self.assertRegex(css, r"body\s*\{[^}]*padding-inline:\s*0\.25em")
         self.assertRegex(css, r"body\s*\{[^}]*overflow-wrap:\s*anywhere")
         self.assertIn(".source-image > img", css)
         self.assertIn("p > .inline-formula:only-child > img", css)
+        self.assertRegex(css, r"\.binding-context\s*\{[^}]*underline solid")
+        self.assertRegex(css, r"\.binding-macro\s*\{[^}]*underline double")
+        self.assertRegex(css, r"\.code-example code(?:\s*,\s*[^{}]+)?\s*\{[^}]*color:\s*inherit")
+        self.assertRegex(css, r"\.roman\s*\{[^}]*font-style:\s*normal")
+        self.assertRegex(css, r"\.source-highlight-pink\s*\{[^}]*text-decoration-thickness:\s*0\.14em")
+        self.assertRegex(css, r"\.binding-example(?:\s*,\s*[^{}]+)?\s*\{[^}]*overflow-x:\s*auto")
+        self.assertRegex(css, r"\.binding-example \.line-block(?:\s*,\s*[^{}]+)?\s*\{[^}]*white-space:\s*nowrap")
+        self.assertRegex(css, r"\.binding-example code(?:\s*,\s*[^{}]+)?\s*\{[^}]*white-space:\s*pre")
 
     def test_inline_formula_style_preserves_relative_dimensions(self) -> None:
         value = {
@@ -3300,6 +3353,10 @@ class TranslatorTests(unittest.TestCase):
                 ROOT / "tools" / "gladtex_filter.py",
                 root / "tools" / "gladtex_filter.py",
             )
+            shutil.copyfile(
+                ROOT / "tools" / "browser_runtime.py",
+                root / "tools" / "browser_runtime.py",
+            )
             entry = root / "main.typ"
             entry.write_text(
                 "#set page(width: 148mm, height: 216mm, margin: 0mm)\n"
@@ -3663,13 +3720,19 @@ class TranslatorTests(unittest.TestCase):
             duplicate_entries[body_name] = ET.tostring(
                 duplicate_document, encoding="utf-8", xml_declaration=True
             )
-            with self.assertRaisesRegex(translator.CliError, "自动图注未移除"):
-                translator.qa_epub(
-                    work,
-                    language,
-                    write_tampered("duplicate-caption.epub", duplicate_entries),
-                    root / "duplicate-caption-evidence",
-                )
+            # Matching alt text does not duplicate a single visible caption.
+            for name in ("duplicate-caption", "manual-duplicate-caption", "generic-alt", "bad-image-media"):
+                (root / f"{name}-evidence").mkdir()
+            matching_caption = write_tampered("duplicate-caption.epub", duplicate_entries)
+            translator.qa_epub(work, language, matching_caption, root / "duplicate-caption-evidence")
+            with zipfile.ZipFile(matching_caption) as archive:
+                checked_body = ET.fromstring(archive.read(body_name))
+            checked_figure = [node for node in checked_body.iter()
+                              if node.tag.rsplit("}", 1)[-1] == "figure"][-1]
+            captions = [node for node in checked_figure
+                        if node.tag.rsplit("}", 1)[-1] == "figcaption"]
+            self.assertEqual(len(captions), 1)
+            self.assertEqual("".join(captions[0].itertext()), "Demand curve diagram")
             manual_duplicate_document = ET.fromstring(entries[body_name])
             manual_duplicate_diagram = next(
                 element
@@ -4516,7 +4579,7 @@ a&=b\\
                 '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>',
                 encoding="utf-8",
             )
-            (work / "assets" / "plain.png").write_bytes(b"png")
+            (work / "assets" / "plain.gif").write_bytes(b"gif")
             outside = base / "outside.svg"
             outside.write_text(
                 '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>',
@@ -4528,7 +4591,7 @@ a&=b\\
                 "parent_escape": r"\epubfallback{../outside.svg}{说明}{print}",
                 "dynamic": r"\epubfallback{\asset}{说明}{print}",
                 "missing": r"\epubfallback{assets/missing.svg}{说明}{print}",
-                "non_svg": r"\epubfallback{assets/plain.png}{说明}{print}",
+                "unsupported_type": r"\epubfallback{assets/plain.gif}{说明}{print}",
                 "empty_alt": r"\epubfallback{assets/fallback.svg}{}{print}",
                 "tex_alt": r"\epubfallback{assets/fallback.svg}{\emph{说明}}{print}",
                 "braced_alt": r"\epubfallback{assets/fallback.svg}{{说明}}{print}",
@@ -4644,7 +4707,7 @@ a&=b\\
             with (
                 mock.patch.object(translator, "load_work", return_value=work),
                 mock.patch.object(translator, "mutool_pages", return_value=(1, "")),
-                mock.patch.object(translator, "validate_page_map"),
+                mock.patch.object(translator, "validate_page_map", return_value=None),
                 mock.patch.object(translator, "preflight_latex_epub") as preflight,
             ):
                 translator.command_check(types.SimpleNamespace(work=work_path))

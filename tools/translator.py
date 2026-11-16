@@ -23,6 +23,7 @@ import urllib.parse
 from urllib.request import url2pathname
 import zipfile
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -30,17 +31,29 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+# Preserve module import order in both execution modes.
+# isort: off
 try:
     from tools import epub_browser_qa, epub_source, page_boundary_audit
+    from tools import epub_page_navigation, epub_semantics, chapter_handoff, epub_bodymatter, epub_footnotes
+    from tools.browser_runtime import run_hidden, resolve_agent_browser, resolve_chromium
     from tools.svg_math_paths import FORMULA_THEME_STYLE, FormulaPathError, expand_local_glyphs
 except ModuleNotFoundError:  # direct ``python tools/translator.py`` execution
     import epub_browser_qa
     import epub_source
     import page_boundary_audit
+    import epub_page_navigation
+    import epub_semantics
+    import chapter_handoff
+    import epub_bodymatter
+    import epub_footnotes
+    from browser_runtime import run_hidden, resolve_agent_browser, resolve_chromium
     from svg_math_paths import FORMULA_THEME_STYLE, FormulaPathError, expand_local_glyphs
+# isort: on
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+WINDOWS_PROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 FORMATS = {"typst", "markdown", "html", "latex"}
 TARGETS = {
     "typst": {"epub", "pdf"},
@@ -72,6 +85,7 @@ SOURCE_UNITS_HEADER = (
     "note",
 )
 GLOSSARY_HEADER = ("kind", "source", "target", "note")
+SOURCE_DISPOSITIONS = frozenset({"retain", "merge", "rebuild", "exclude"})
 GLOSSARY_KINDS = {
     "title",
     "author",
@@ -92,12 +106,8 @@ SOURCE_PAGE_RE = re.compile(r"#source-page\(\s*(\d+)\s*\)")
 MARKDOWN_SOURCE_PAGE_RE = re.compile(
     r"\{[^}]*\.source-page[^}]*\bdata-page=[\"'](\d+)[\"'][^}]*\}"
 )
-MARKDOWN_SOURCE_PAGE_MARKER_RE = re.compile(
-    r"\[\]\{[^}\r\n]*\.source-page[^}\r\n]*\}"
-)
-CJK_BOUNDARY_CHAR_RE = re.compile(
-    r"[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]"
-)
+MARKDOWN_SOURCE_PAGE_MARKER_RE = re.compile(r"\[\]\{[^}\r\n]*\.source-page[^}\r\n]*\}")
+CJK_BOUNDARY_CHAR_RE = re.compile(r"[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]")
 MARKDOWN_SOURCE_UNIT_RE = re.compile(
     r"\{[^}]*\.source-unit[^}]*\bdata-unit=[\"'](\d+)[\"'][^}]*\}"
 )
@@ -107,17 +117,13 @@ LATEX_INCLUDE_RE = re.compile(r"\\(?:input|include)\s*\{([^{}\r\n]+)\}")
 LATEX_GRAPHICS_RE = re.compile(
     r"\\includegraphics(?:\s*\[[^\]\r\n]*\])?\s*\{([^{}\r\n]+)\}"
 )
-MARKDOWN_IMAGE_RE = re.compile(
-    r"!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))"
-)
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))")
 MARKDOWN_STANDALONE_IMAGE_RE = re.compile(
     r"^ {0,3}!\[(?P<alt>[^\]\r\n]*)\]\([^\r\n]*\)"
     r"[ \t]*(?P<attrs>\{[^}\r\n]*\})?"
     r"(?:\[\]\{\.image-tail\})?[ \t]*$"
 )
-MARKDOWN_FIGURE_NUMBER_PATTERN = (
-    r"(?:[A-Z](?:\.\d+)+|\d+(?:\.\d+)*(?:[a-z])?)"
-)
+MARKDOWN_FIGURE_NUMBER_PATTERN = r"(?:[A-Z](?:\.\d+)+|\d+(?:\.\d+)*(?:[a-z])?)"
 MARKDOWN_NUMBERED_FIGURE_CAPTION_RE = re.compile(
     rf"^(?:图|Figures?|Figs?)\.?[ \t]*"
     rf"(?P<numbers>{MARKDOWN_FIGURE_NUMBER_PATTERN}"
@@ -125,13 +131,9 @@ MARKDOWN_NUMBERED_FIGURE_CAPTION_RE = re.compile(
     rf"{MARKDOWN_FIGURE_NUMBER_PATTERN})*)",
     re.IGNORECASE,
 )
-MARKDOWN_FIGURE_NUMBER_RE = re.compile(
-    MARKDOWN_FIGURE_NUMBER_PATTERN, re.IGNORECASE
-)
+MARKDOWN_FIGURE_NUMBER_RE = re.compile(MARKDOWN_FIGURE_NUMBER_PATTERN, re.IGNORECASE)
 TYPST_IMAGE_RE = re.compile(r"#?image\s*\(\s*[\"']([^\"']+)[\"']")
-SOURCE_RASTER_SUFFIXES = frozenset(
-    {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
-)
+SOURCE_RASTER_SUFFIXES = frozenset({".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
 PDF_IMAGE_SUFFIXES = SOURCE_RASTER_SUFFIXES | frozenset(
     {
         ".ccitt",
@@ -190,6 +192,8 @@ WORK_COMMANDS = frozenset(
         "scratch",
         "source-draft",
         "source-probe",
+        "source-figures",
+        "handoff-check",
     }
 )
 ACTIVITIES = (
@@ -247,16 +251,7 @@ GENERIC_IMAGE_ALT = {
     "插图",
 }
 LATEX_CONTROL = re.compile(r"\\[A-Za-z]+")
-GLADTEX_FORMATTING_COMMANDS = (
-    r"\ ",
-    r"\,",
-    r"\;",
-    r"\big",
-    r"\Big",
-    r"\left",
-    r"\right",
-    r"\limits",
-)
+GLADTEX_FORMATTING_COMMANDS = epub_semantics.GLADTEX_FORMATTING_COMMANDS
 
 
 class CliError(Exception):
@@ -322,10 +317,24 @@ def inside(
     return candidate
 
 
+def source_disposition(row: dict[str, str], label: str) -> str:
+    value = (row.get("disposition") or "").strip() or "retain"
+    if value not in SOURCE_DISPOSITIONS:
+        raise CliError(f"{label} disposition 无效：{value}")
+    if value != "retain" and not (row.get("note") or "").strip():
+        raise CliError(f"{label} 的 {value} 必须在 note 写明理由")
+    return value
+
+
+def mapping_header_valid(fields: tuple[str, ...], base: tuple[str, ...]) -> bool:
+    return fields in (base, (*base, "disposition"))
+
+
 def read_source_units(path: Path) -> tuple[dict[str, str], ...]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-        if tuple(reader.fieldnames or ()) != SOURCE_UNITS_HEADER:
+        fields = tuple(reader.fieldnames or ())
+        if not mapping_header_valid(fields, SOURCE_UNITS_HEADER):
             raise CliError("source-units.tsv 表头不符合项目契约")
         rows: list[dict[str, str]] = []
         for row_number, row in enumerate(reader, start=2):
@@ -344,7 +353,8 @@ def read_source_units(path: Path) -> tuple[dict[str, str], ...]:
                 raise CliError(
                     f"source-units.tsv 第 {row_number} 行 linear 必须是 yes 或 no"
                 )
-            rows.append({key: row.get(key, "") for key in SOURCE_UNITS_HEADER})
+            source_disposition(row, f"source-units.tsv 第 {row_number} 行")
+            rows.append({key: row.get(key, "") for key in fields})
     if not rows:
         raise CliError("source-units.tsv 不能为空")
     if [int(row["unit_id"]) for row in rows] != list(range(1, len(rows) + 1)):
@@ -382,6 +392,7 @@ def run(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process_env = os.environ.copy() if env is None else env.copy()
     process_temp = str(temp_root())
@@ -390,13 +401,14 @@ def run(
     # Tool-only uv dependencies must not rewrite the repository lockfile.
     process_env["UV_FROZEN"] = "true"
     try:
-        result = subprocess.run(
+        result = run_hidden(
             command,
             cwd=cwd,
             env=process_env,
             text=True,
             capture_output=True,
             errors="replace",
+            **({"input": input_text, "encoding": "utf-8"} if input_text is not None else {}),
         )
     except FileNotFoundError as error:
         raise CliError(f"找不到命令：{command[0]}") from error
@@ -632,10 +644,20 @@ def load_work(value: str | Path, root: Path = REPO_ROOT) -> Work:
         epub_data = manifest.get("epub")
         if not isinstance(epub_data, dict):
             raise CliError("EPUB 输出必须设置 [epub]")
-        for key in ("title", "author", "identifier"):
+        for key in ("title", "author", "identifier", "bodymatter"):
             value = epub_data.get(key)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise CliError(f"epub.{key} 必须是非空字符串")
+        if "title_page" in epub_data and not isinstance(epub_data["title_page"], bool):
+            raise CliError("epub.title_page 必须是布尔值")
+        if authoring_format == "latex" and "native_caption_numbers" in epub_data and not isinstance(
+            epub_data["native_caption_numbers"], bool
+        ):
+            raise CliError("epub.native_caption_numbers 必须是布尔值")
+        depth = epub_data.get("toc_depth", 3)
+        if type(depth) is not int or not 1 <= depth <= 6:
+            raise CliError("epub.toc_depth 必须是 1--6 的整数")
+        epub_split_level(epub_data.get("split_level"), default=2)
         cover_raw = epub_data.get("cover")
         if cover_raw is not None:
             if not isinstance(cover_raw, str) or not cover_raw:
@@ -740,6 +762,7 @@ def status_document_state(path: Path) -> str | None:
         # An unknown declaration must not inherit a state from its explanation.
         return None
     return None
+
 
 def validate_manifest_status_alignment(work: Work) -> None:
     work_path = getattr(work, "path", None)
@@ -1252,6 +1275,171 @@ def latex_skip_space(text: str, position: int) -> int:
     return position
 
 
+def normalize_latex_native_captions(text: str) -> str:
+    """Preserve caption* and check float ordering for the opt-in EPUB reader."""
+    masked = list(text)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, end):
+            if masked[index] not in "\r\n":
+                masked[index] = " "
+
+    command_pattern = re.compile(r"\\([A-Za-z@]+)")
+    position = 0
+    while position < len(text):
+        if text[position] == "%":
+            end = text.find("\n", position)
+            end = len(text) if end < 0 else end
+            blank(position, end)
+            position = end
+            continue
+        if text[position] != "\\":
+            position += 1
+            continue
+        command = command_pattern.match(text, position)
+        if not command:
+            # A control symbol such as \\ or \% is not a command start.
+            end = min(len(text), position + 2)
+            blank(position, end)
+            position = end
+            continue
+        name = command.group(1)
+        end = command.end()
+        if name == "verb":
+            delimiter_pos = end + (end < len(text) and text[end] == "*")
+            if delimiter_pos >= len(text) or text[delimiter_pos] in "\r\n":
+                raise CliError("LaTeX verb 缺少分隔符")
+            close = text.find(text[delimiter_pos], delimiter_pos + 1)
+            newline = text.find("\n", delimiter_pos + 1)
+            if close < 0 or (newline >= 0 and close > newline):
+                raise CliError("LaTeX verb 未闭合")
+            blank(position, close + 1)
+            position = close + 1
+            continue
+        if name == "begin":
+            argument = latex_braced(text, latex_skip_space(text, end))
+            if argument and argument[0] in {"verbatim", "verbatim*", "Verbatim", "lstlisting", "minted"}:
+                env = argument[0]
+                closing = re.search(r"\\end\s*\{" + re.escape(env) + r"\}", text[argument[1]:])
+                if not closing:
+                    raise CliError(f"LaTeX {env} 环境未闭合")
+                close = argument[1] + closing.end()
+                blank(position, close)
+                position = close
+                continue
+        position = end
+
+    masked_text = "".join(masked)
+    if re.search(r"\\epubcaptionunnumbered(?![A-Za-z@])", masked_text):
+        raise CliError("LaTeX EPUB 保留标记 epubcaptionunnumbered 不得出现在来源中")
+
+    def optional_short_end(position: int) -> int:
+        if position >= len(text) or masked_text[position] != "[":
+            return position
+        # TeX optional arguments end at the first unescaped ], except inside braces.
+        depth = 0
+        for cursor in range(position + 1, len(text)):
+            char = masked_text[cursor]
+            if char == "{":
+                depth += 1
+            elif char == "}" and depth:
+                depth -= 1
+            elif char == "]" and depth == 0:
+                return cursor + 1
+        raise CliError("LaTeX caption 短图注未闭合")
+
+    # Pandoc moves a Table's raw commands outside the float and separates each
+    # Figure's body from its Caption, so these orders cannot be reconstructed.
+    floats: list[dict[str, Any]] = []
+    replacements: list[tuple[int, int, str]] = []
+    events = re.finditer(
+        r"\\(begin|end|caption|setcounter|addtocounter|stepcounter|refstepcounter|epubcounterformat)(?![A-Za-z@])",
+        masked_text,
+    )
+
+    def location(item: dict[str, Any], position: int) -> str:
+        name = item["name"]
+        closing = re.search(
+            r"\\end\s*\{" + re.escape(name) + r"\}", masked_text[position:]
+        )
+        end = position + closing.end() if closing else len(masked_text)
+        content = masked_text[item["start"]:end]
+        label = re.search(r"\\label\s*\{([^{}]+)\}", content)
+        identity = f"（{label.group(1)}）" if label else "（无标签）"
+        line = masked_text.count("\n", 0, position) + 1
+        return f"{name}{identity}，展开输入第 {line} 行"
+
+    for event in events:
+        command = event.group(1)
+        if command in {"begin", "end"}:
+            argument = latex_braced(masked_text, latex_skip_space(masked_text, event.end()))
+            if argument and argument[0] in {"figure", "figure*", "table", "table*"}:
+                name = argument[0]
+                if command == "begin":
+                    floats.append({"name": name, "start": event.start(), "caption": False, "formats": []})
+                elif floats and floats[-1]["name"] == name:
+                    item = floats.pop()
+                    # A format local to an uncaptioned table cannot affect any
+                    # later float; discard it from the temporary reader input.
+                    for start, end, _ in item["formats"]:
+                        replacements.append((start, end, ""))
+            continue
+        if not floats:
+            continue
+        item = floats[-1]
+        if command == "caption":
+            if item["formats"]:
+                cursor = latex_skip_space(masked_text, event.end())
+                if cursor < len(text) and masked_text[cursor] == "*":
+                    cursor = latex_skip_space(masked_text, cursor + 1)
+                cursor = latex_skip_space(masked_text, optional_short_end(cursor))
+                if not latex_braced(masked_text, cursor):
+                    raise CliError("LaTeX caption 缺少正文：" + location(item, event.start()))
+                # Put local table formats in the native caption so Lua sees
+                # them before numbering and can restore the prior format.
+                formats = item["formats"]
+                replacements.append((cursor + 1, cursor + 1, "".join(x[2] for x in formats)))
+                replacements.extend((start, end, "") for start, end, _ in formats)
+                item["formats"] = []
+            item["caption"] = True
+        elif command in {"setcounter", "addtocounter", "stepcounter", "refstepcounter"}:
+            argument = latex_braced(masked_text, latex_skip_space(masked_text, event.end()))
+            if argument and argument[0].strip() in {"figure", "table"}:
+                raise CliError(
+                    f"LaTeX 原生图表编号不支持浮动体内 \\{command}："
+                    + location(item, event.start())
+                )
+        elif command == "epubcounterformat":
+            argument = latex_braced(masked_text, latex_skip_space(masked_text, event.end()))
+            kind = item["name"].rstrip("*")
+            target = argument[0].strip() if argument else ""
+            if target in {"figure", "table"} and target != kind:
+                raise CliError(
+                    f"LaTeX 原生图表编号不支持浮动体内定义其他图表格式 \\the{target}："
+                    + location(item, event.start())
+                )
+            if argument and target == kind and item["caption"]:
+                raise CliError(
+                    f"LaTeX 原生图表编号不支持 caption 后定义 \\the{kind}："
+                    + location(item, event.start())
+                )
+            if argument and target == "table" and kind == "table":
+                value = latex_braced(masked_text, latex_skip_space(masked_text, argument[1]))
+                if not value:
+                    raise CliError("LaTeX thetable 格式缺少正文：" + location(item, event.start()))
+                item["formats"].append((event.start(), value[1], text[event.start():value[1]]))
+
+    for match in re.finditer(r"\\caption(?![A-Za-z@])\s*\*", masked_text):
+        end = match.end()
+        cursor = latex_skip_space(masked_text, end)
+        if cursor < len(text) and masked_text[cursor] == "[":
+            end = optional_short_end(cursor)
+        replacements.append((match.start(), end, r"\caption[\epubcaptionunnumbered]"))
+    for start, end, replacement in sorted(replacements, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
 def latex_graphic_paths(
     text: str,
     entry: Path,
@@ -1354,8 +1542,8 @@ def normalize_latex_graphics(
             alt = text[alt_start + 1 : alt_argument[1] - 1].strip()
             if not alt or any(char in alt for char in "\\{}$#%"):
                 raise CliError(f"LaTeX EPUB 回退替代文本必须是非空纯文本：{entry}")
-            if Path(raw_path).suffix.lower() != ".svg":
-                raise CliError(f"LaTeX EPUB 回退图像必须是 SVG：{entry}:{raw_path}")
+            if Path(raw_path).suffix.lower() not in {".svg", ".png", ".jpg", ".jpeg"}:
+                raise CliError(f"LaTeX EPUB 回退图像必须是 SVG、PNG 或 JPEG：{entry}:{raw_path}")
             path_slice = (path_start + 1, path_argument[1] - 1)
             error_label = "LaTeX EPUB 回退图像"
         else:
@@ -1863,9 +2051,14 @@ def validate_source_page_sequence(
     expected_count: int | None = None,
     *,
     expected_start: int = 1,
+    expected_pages: list[int] | None = None,
 ) -> None:
     if pages != sorted(set(pages)):
         raise CliError(f"{label} 的源页标记必须严格升序且不得重复")
+    if expected_pages is not None:
+        if pages != expected_pages:
+            raise CliError(f"{label} 的源页标记必须匹配 page-map.tsv 纳入范围")
+        return
     if expected_count is not None and pages != list(range(1, expected_count + 1)):
         expected = list(range(expected_start, expected_count + 1))
         if pages != expected:
@@ -1880,18 +2073,22 @@ def validate_source_unit_sequence(
     expected: list[int],
 ) -> None:
     if units != expected:
-        raise CliError(f"{label} 的 source-unit 标记必须严格覆盖 1--{len(expected)}")
+        raise CliError(
+            f"{label} 的 source-unit 标记必须按顺序严格匹配纳入单元：{compress_page_spec(expected)}"
+        )
 
 
-def validate_page_map(work: Work) -> None:
+def validate_page_map(work: Work) -> list[int] | None:
     path = work.path / "page-map.tsv"
     if not path.is_file():
         raise CliError(f"缺少 page-map.tsv：{path}")
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-        if tuple(reader.fieldnames or ()) != PAGE_MAP_HEADER:
+        fields = tuple(reader.fieldnames or ())
+        if not mapping_header_valid(fields, PAGE_MAP_HEADER):
             raise CliError("page-map.tsv 表头不符合项目契约")
         pages: list[int] = []
+        included: list[int] = []
         for row_number, row in enumerate(reader, start=2):
             try:
                 pages.append(int(row["pdf_page"]))
@@ -1899,9 +2096,15 @@ def validate_page_map(work: Work) -> None:
                 raise CliError(
                     f"page-map.tsv 第 {row_number} 行 pdf_page 无效"
                 ) from error
+            if source_disposition(row, f"page-map.tsv 第 {row_number} 行") in {
+                "retain",
+                "merge",
+            }:
+                included.append(pages[-1])
     expected = list(range(1, work.source_pages + 1))
     if pages != expected:
         raise CliError("page-map.tsv 的 pdf_page 必须从 1 到来源总页数连续且唯一")
+    return included if "disposition" in fields else None
 
 
 def validate_glossary(path: Path) -> None:
@@ -1926,12 +2129,20 @@ def validate_glossary(path: Path) -> None:
                 )
 
 
-def check_typst_pairs(work: Work) -> list[str]:
+def check_typst_pairs(
+    work: Work, *, expected_pages: list[int] | None = None
+) -> list[str]:
     messages: list[str] = []
     source_language = next(
         language for language in work.languages if language.role == "source"
     )
     source_text = mask_typst_comments(expand_typst(source_language.entry, work.root))
+    if expected_pages is not None:
+        validate_source_page_sequence(
+            source_pages_for("typst", source_text),
+            source_language.code,
+            expected_pages=expected_pages,
+        )
     messages.append(
         f"{source_language.code}: {len(SOURCE_PAGE_RE.findall(source_text))} 个源页标记"
     )
@@ -1946,6 +2157,12 @@ def check_typst_pairs(work: Work) -> list[str]:
         if language.role != "translation":
             continue
         translated_text = mask_typst_comments(expand_typst(language.entry, work.root))
+        if expected_pages is not None:
+            validate_source_page_sequence(
+                source_pages_for("typst", translated_text),
+                language.code,
+                expected_pages=expected_pages,
+            )
         messages.append(
             f"{language.code}: {len(SOURCE_PAGE_RE.findall(translated_text))} 个源页标记"
         )
@@ -2010,9 +2227,12 @@ def command_check(args: argparse.Namespace) -> int:
                 "EPUB 页面锚点集合不符合 manifest："
                 f"{compress_page_spec(actual_anchors)} != {expected_anchor_set}"
             )
+    included_pdf_pages = None
     if work.source.suffix.lower() == ".pdf":
-        validate_page_map(work)
+        included_pdf_pages = validate_page_map(work)
     for language in work.languages:
+        if "epub" in language.outputs:
+            load_page_navigation(work, language)
         if language.glossary:
             validate_glossary(language.glossary)
 
@@ -2021,7 +2241,7 @@ def command_check(args: argparse.Namespace) -> int:
     if image_message:
         messages.append(image_message)
     if work.authoring_format == "typst":
-        messages.extend(check_typst_pairs(work))
+        messages.extend(check_typst_pairs(work, expected_pages=included_pdf_pages))
     else:
         source_language = next(
             language for language in work.languages if language.role == "source"
@@ -2051,9 +2271,7 @@ def command_check(args: argparse.Namespace) -> int:
                 else:
                     translated_text = language.entry.read_text(encoding="utf-8")
                 if work.authoring_format == "markdown":
-                    validate_markdown_numbered_headings(
-                        translated_text, language.code
-                    )
+                    validate_markdown_numbered_headings(translated_text, language.code)
                     messages.extend(
                         validate_markdown_structure(work, language, translated_text)
                     )
@@ -2071,7 +2289,12 @@ def command_check(args: argparse.Namespace) -> int:
             validate_source_unit_sequence(
                 source_markers,
                 source_language.code,
-                [int(row["unit_id"]) for row in work.source_unit_rows],
+                [
+                    int(row["unit_id"])
+                    for row in work.source_unit_rows
+                    if source_disposition(row, "source-units.tsv")
+                    in {"retain", "merge"}
+                ],
             )
             messages.append(
                 f"{source_language.code}: {len(source_markers)} 个逻辑源单元标记"
@@ -2091,6 +2314,7 @@ def command_check(args: argparse.Namespace) -> int:
                     source_language.code,
                     work.source_pages,
                     expected_start=source_markers[0] if source_markers else 1,
+                    expected_pages=included_pdf_pages,
                 )
             messages.append(f"{source_language.code}: {len(source_markers)} 个源页标记")
 
@@ -2259,7 +2483,7 @@ def _pandoc_boundary_ast(work: Work, text: str, format_name: str) -> dict[str, A
     process_env["TEMP"] = process_temp
     process_env["TMP"] = process_temp
     try:
-        process = subprocess.run(
+        process = run_hidden(
             ["pandoc", "--from", reader, "--to", "json"],
             input=text,
             cwd=work.root,
@@ -2368,8 +2592,12 @@ def markdown_source_page_spacing_candidates(text: str) -> list[int]:
     return candidates
 
 
-def markdown_figure_traceability_problems(text: str) -> list[str]:
+def markdown_figure_traceability_problems(
+    text: str, document: Any | None = None
+) -> list[str]:
     """Check figure numbers already declared by explicit Markdown captions."""
+    if document is not None:
+        return pandoc_numbered_image_problems(document)
     lines = text.splitlines()
     problems: list[str] = []
     fence: tuple[str, int] | None = None
@@ -2400,9 +2628,7 @@ def markdown_figure_traceability_problems(text: str) -> list[str]:
         while cursor < len(lines):
             while cursor < len(lines) and not lines[cursor].strip():
                 cursor += 1
-            if cursor >= len(lines) or re.match(
-                r"^ {0,3}(`{3,}|~{3,})", lines[cursor]
-            ):
+            if cursor >= len(lines) or re.match(r"^ {0,3}(`{3,}|~{3,})", lines[cursor]):
                 break
             following_image = MARKDOWN_STANDALONE_IMAGE_RE.match(lines[cursor])
             if not following_image:
@@ -2411,9 +2637,7 @@ def markdown_figure_traceability_problems(text: str) -> list[str]:
             cursor += 1
 
         caption = (
-            MARKDOWN_NUMBERED_FIGURE_CAPTION_RE.match(
-                lines[cursor].lstrip(" \t*_")
-            )
+            MARKDOWN_NUMBERED_FIGURE_CAPTION_RE.match(lines[cursor].lstrip(" \t*_"))
             if cursor < len(lines)
             else None
         )
@@ -2439,13 +2663,178 @@ def markdown_figure_traceability_problems(text: str) -> list[str]:
                     re.IGNORECASE,
                 ):
                     missing.append(f"原图号 {number}")
-                if not re.search(r"#fig-[A-Za-z0-9][A-Za-z0-9._:-]*", attrs):
+                if document is None and not re.search(
+                    r"#fig-[A-Za-z0-9][A-Za-z0-9._:-]*", attrs
+                ):
                     missing.append("#fig- 标识")
                 if missing:
-                    problems.append(
-                        f"第 {line_number} 行图片缺少{'、'.join(missing)}"
-                    )
+                    problems.append(f"第 {line_number} 行图片缺少{'、'.join(missing)}")
         index = cursor + 1 if caption else index + 1
+    return problems
+
+
+def pandoc_numbered_image_problems(document: Any) -> list[str]:
+    """Validate explicit caption groups against real Image/Figure nodes."""
+    problems: list[str] = []
+    records: dict[int, tuple[str, str]] = {}
+    checked: set[int] = set()
+    math_images: set[int] = set()
+
+    def inline_text(value: Any, *, omit_images: bool = False) -> str:
+        if isinstance(value, list):
+            return "".join(
+                inline_text(child, omit_images=omit_images) for child in value
+            )
+        if isinstance(value, dict):
+            kind = value.get("t")
+            if kind == "Image" and omit_images:
+                return ""
+            if kind == "Str":
+                return value["c"]
+            if kind in {"Space", "SoftBreak", "LineBreak"}:
+                return " "
+            if kind in {"Code", "Math"}:
+                return value["c"][-1]
+            return inline_text(value.get("c"), omit_images=omit_images)
+        return ""
+
+    def collect(value: Any, figure_id: str = "", math_scope: bool = False) -> None:
+        if isinstance(value, list):
+            for child in value:
+                collect(child, figure_id, math_scope)
+        elif isinstance(value, dict):
+            content = value.get("c", [])
+            if value.get("t") in {"Image", "Figure", "Div", "Span"}:
+                math_scope = math_scope or bool(
+                    {"math-inline", "math-display"}.intersection(content[0][1])
+                )
+            if value.get("t") == "Figure":
+                figure_id = content[0][0]
+            elif value.get("t") == "Image" and math_scope:
+                math_images.add(id(value))
+            elif value.get("t") == "Image":
+                records[id(value)] = (
+                    inline_text(content[1]).strip(),
+                    content[0][0] or figure_id,
+                )
+            for child in value.values():
+                collect(child, figure_id, math_scope)
+
+    def image_nodes(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, list):
+            return [image for child in value for image in image_nodes(child)]
+        if isinstance(value, dict):
+            if value.get("t") == "Image":
+                return [] if id(value) in math_images else [value]
+            return [image for child in value.values() for image in image_nodes(child)]
+        return []
+
+    def standalone(block: Any) -> list[dict[str, Any]]:
+        if not isinstance(block, dict):
+            return []
+        if block.get("t") == "Figure":
+            return image_nodes(block["c"][2])
+        if (
+            block.get("t") in {"Para", "Plain"}
+            and not inline_text(block["c"], omit_images=True).strip()
+        ):
+            return image_nodes(block["c"])
+        return []
+
+    def check_groups(blocks: list[Any]) -> None:
+        index = 0
+        while index < len(blocks):
+            images = standalone(blocks[index])
+            if not images:
+                index += 1
+                continue
+            cursor = index + 1
+            while cursor < len(blocks):
+                following = standalone(blocks[cursor])
+                if not following:
+                    break
+                images.extend(following)
+                cursor += 1
+            caption = None
+            if (
+                cursor < len(blocks)
+                and isinstance(blocks[cursor], dict)
+                and blocks[cursor].get("t") in {"Para", "Plain"}
+            ):
+                inlines = blocks[cursor]["c"]
+                first = next(
+                    (item for item in inlines if inline_text(item).strip()), None
+                )
+                # A leading native Link is a body cross-reference, not an
+                # adjacent caption inferred from its visible figure label.
+                if first is None or first.get("t") != "Link":
+                    caption = MARKDOWN_NUMBERED_FIGURE_CAPTION_RE.match(
+                        inline_text(inlines).strip()
+                    )
+            if caption:
+                numbers = MARKDOWN_FIGURE_NUMBER_RE.findall(caption.group("numbers"))
+                if len(numbers) != len(images):
+                    problems.append(
+                        f"编号图片组有 {len(images)} 幅图片、{len(numbers)} 个图号"
+                    )
+                else:
+                    for image, number in zip(images, numbers, strict=True):
+                        checked.add(id(image))
+                        alt, identifier = records[id(image)]
+                        missing = []
+                        if not re.search(
+                            rf"(?:图|Figures?|Figs?)\.?[ \t]*{re.escape(number)}(?=$|[^\w.])",
+                            alt,
+                            re.IGNORECASE,
+                        ):
+                            missing.append(f"原图号 {number}")
+                        if not identifier.startswith("fig-"):
+                            missing.append("实际解析的 #fig- 标识")
+                        if missing:
+                            problems.append(
+                                f"编号图片 {alt[:80]} 缺少{'、'.join(missing)}"
+                            )
+            index = cursor + 1 if caption else cursor
+
+    block_types = {
+        "Para",
+        "Plain",
+        "Figure",
+        "Div",
+        "BlockQuote",
+        "Header",
+        "BulletList",
+        "OrderedList",
+        "Table",
+        "CodeBlock",
+        "RawBlock",
+        "HorizontalRule",
+        "LineBlock",
+        "DefinitionList",
+    }
+
+    def scan(value: Any) -> None:
+        if isinstance(value, list):
+            if value and all(
+                isinstance(item, dict) and item.get("t") in block_types
+                for item in value
+            ):
+                check_groups(value)
+            for child in value:
+                scan(child)
+        elif isinstance(value, dict):
+            for child in value.values():
+                scan(child)
+
+    collect(document)
+    scan(document)
+    for identity, (alt, identifier) in records.items():
+        if (
+            identity not in checked
+            and MARKDOWN_NUMBERED_FIGURE_CAPTION_RE.match(alt)
+            and not identifier.startswith("fig-")
+        ):
+            problems.append(f"编号图片 {alt[:80]} 缺少实际解析的 #fig- 标识")
     return problems
 
 
@@ -2463,7 +2852,8 @@ def validate_markdown_structure(
         raise CliError(
             f"{language.code} Markdown 代码围栏外存在 Git 冲突标记：第 {locations} 行"
         )
-    figure_problems = markdown_figure_traceability_problems(text)
+    document = _pandoc_boundary_ast(work, text, "markdown")
+    figure_problems = markdown_figure_traceability_problems(text, document)
     if figure_problems:
         if work.manifest.get("work", {}).get("status") == "complete":
             messages.append(
@@ -2473,10 +2863,12 @@ def validate_markdown_structure(
             details = "；".join(figure_problems[:8])
             if len(figure_problems) > 8:
                 details += "……"
-            raise CliError(
-                f"{language.code} Markdown 编号图追溯不完整：{details}"
-            )
-    document = _pandoc_boundary_ast(work, text, "markdown")
+            raise CliError(f"{language.code} Markdown 编号图追溯不完整：{details}")
+    heading_problems = markdown_marker_heading_problems(document)
+    if heading_problems:
+        raise CliError(
+            f"{language.code} Markdown 溯源标记破坏标题结构：{heading_problems[0]}"
+        )
     fragments = _pandoc_list_marker_fragments(document)
     if fragments:
         raise CliError(
@@ -2484,6 +2876,53 @@ def validate_markdown_structure(
             "列表项目被解析成普通段落"
         )
     return messages
+
+
+def markdown_marker_heading_problems(document: Any) -> list[str]:
+    problems: list[str] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for child in node:
+                visit(child)
+        elif isinstance(node, dict):
+            kind = node.get("t")
+            content = node.get("c", [])
+            if kind == "Header":
+
+                def contains_marker(value: Any) -> bool:
+                    if _pandoc_source_marker_class(value):
+                        return True
+                    if isinstance(value, list):
+                        return any(contains_marker(child) for child in value)
+                    if isinstance(value, dict):
+                        return any(contains_marker(child) for child in value.values())
+                    return False
+
+                if contains_marker(content):
+                    problems.append("溯源标记不得放入标题节点")
+            elif kind in {"Para", "Plain"} and isinstance(content, list):
+                marker_seen = False
+                for inline in content:
+                    if _pandoc_source_marker_class(inline):
+                        marker_seen = True
+                        continue
+                    if inline.get("t") in {"Space", "SoftBreak", "LineBreak"}:
+                        continue
+                    if (
+                        marker_seen
+                        and inline.get("t") == "Str"
+                        and re.fullmatch(r"#{1,6}", inline.get("c", ""))
+                    ):
+                        problems.append(
+                            "标题被解析成含 # 的普通段落；请把标记绑定到正文而非标题前"
+                        )
+                    break
+            for child in node.values():
+                visit(child)
+
+    visit(document)
+    return problems
 
 
 def _write_boundary_report(
@@ -2684,8 +3123,15 @@ def required_tools(work: Work, purpose: str) -> list[tuple[str, bool]]:
         need("java")
         tools["EPUBCheck"] = EPUBCHECK_JAR.is_file()
     if purpose in {"all", "browser-qa"} and has_epub:
-        browser = os.environ.get("TRANSLATOR_AGENT_BROWSER", "agent-browser")
-        need("agent-browser", shutil.which(browser) is not None)
+        try:
+            tools["agent-browser"] = resolve_agent_browser(os.environ).is_file()
+        except FileNotFoundError:
+            tools["agent-browser"] = False
+        if os.name == "nt":
+            try:
+                tools["Chromium headless"] = resolve_chromium(os.environ).is_file()
+            except FileNotFoundError:
+                tools["Chromium headless"] = False
     return sorted(tools.items())
 
 
@@ -2795,7 +3241,7 @@ def snapshot_path_allowed(path: str) -> bool:
 def workflow_dirty_snapshot(root: Path) -> dict[str, dict[str, object]]:
     """Return dirty Git paths and digests without retaining file content."""
     try:
-        result = subprocess.run(
+        result = run_hidden(
             ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=root,
             capture_output=True,
@@ -3233,7 +3679,7 @@ def close_workflow_station(context: dict[str, Any]) -> None:
 
 def workflow_revision(root: Path) -> str | None:
     try:
-        result = subprocess.run(
+        result = run_hidden(
             ["git", "rev-parse", "--short=12", "HEAD"],
             cwd=root,
             text=True,
@@ -3344,6 +3790,46 @@ def command_scratch(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_handoff_check(args: argparse.Namespace) -> int:
+    """Check an explicit Markdown chapter package before root merges it."""
+    work = load_command_work(args)
+    if work.authoring_format != "markdown":
+        raise CliError("handoff-check 当前使用 Markdown 正式 reader；其他 Adapter 保留既有流程")
+    language = next((item for item in work.languages if item.code == args.lang), None)
+    if language is None:
+        raise CliError(f"未知交接语言：{args.lang}")
+    raw_root = Path(args.root) if args.root else work.path
+    package_root = (raw_root if raw_root.is_absolute() else work.root / raw_root).resolve()
+    scratch_root = (work_temp(work) / "scratch").resolve()
+    if not (package_root.is_relative_to(work.path) or package_root.is_relative_to(scratch_root)):
+        raise CliError("交接根必须在本书 Works 或本书 scratch 内")
+    try:
+        scope = chapter_handoff.ChapterScope.from_dict(json.loads(
+            inside(package_root, args.scope_file, "--scope-file", must_exist=True).read_text(encoding="utf-8")
+        ))
+        if args.lang not in scope.languages:
+            raise CliError("--lang 不在受控交接语言范围内")
+        package = json.loads(
+            inside(package_root, args.package, "--package", must_exist=True).read_text(encoding="utf-8")
+        )
+        glossary = {}
+        if language.glossary:
+            validate_glossary(language.glossary)
+            with language.glossary.open(encoding="utf-8", newline="") as handle:
+                glossary = {row["source"]: row["target"] for row in csv.DictReader(handle, delimiter="\t")}
+        report = chapter_handoff.validate_handoff(
+            package, root=package_root, scope=scope, glossary=glossary,
+            read_ast=lambda path: _pandoc_boundary_ast(work, path.read_text(encoding="utf-8"), "markdown"),
+        )
+    except (OSError, json.JSONDecodeError, chapter_handoff.HandoffError) as error:
+        raise CliError(str(error)) from error
+    print(json.dumps({"chapter_id": report.chapter_id, "languages": report.languages,
+                      "source_count": len(report.source_ids), "assets": len(report.assets),
+                      "terms": report.terms, "issues": report.issues,
+                      "visual_review_owner_required": report.positions_require_visual_review}, ensure_ascii=False))
+    return 0
+
+
 def source_probe(work: Work, agent: str) -> tuple[Any, dict[str, object], Path, Path]:
     if work.source.suffix.lower() != ".epub":
         raise CliError("source-probe/source-draft 只支持 EPUB 原生来源")
@@ -3396,6 +3882,58 @@ def command_source_draft(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def command_source_figures(args: argparse.Namespace) -> int:
+    """Localize source figure candidates without changing formal book files."""
+    work = load_command_work(args)
+    if work.source_kind != "pdf":
+        raise CliError("source-figures 只支持 PDF 来源")
+    spec = args.pages
+    if not PAGES_RE.fullmatch(spec):
+        raise CliError("--pages 必须是非空 PDF 页码或范围，例如 3,8-10")
+    for part in spec.split(","):
+        bounds = [int(value) for value in part.split("-", 1)]
+        if any(value < 1 or value > work.source_pages for value in bounds):
+            raise CliError(f"--pages 越出来源的 1--{work.source_pages} 页")
+    pages = expand_page_spec(spec)
+    if len(pages) != len(set(pages)):
+        raise CliError("--pages 不得重复选择同一 PDF 页")
+    runtime = Path(args.runtime)
+    runtime = (runtime if runtime.is_absolute() else work.root / runtime).resolve()
+    if not runtime.is_file():
+        raise CliError(f"runtime 配置不存在：{runtime}")
+    reuse = None
+    if getattr(args, "reuse", None):
+        raw = Path(args.reuse)
+        reuse = (raw if raw.is_absolute() else work.root / raw).resolve()
+        try:
+            reuse.relative_to(work_temp(work))
+        except ValueError as error:
+            raise CliError("--reuse 必须是同一作品 scratch 内的报告") from error
+        if not reuse.is_file():
+            raise CliError(f"复用报告不存在：{reuse}")
+    try:
+        from tools import source_figures
+    except ModuleNotFoundError:
+        import source_figures
+    base = scratch_dir(work, args.agent)
+    output = owned_child(base, f"source-figures-{workflow_run_id()}", "图形候选目录")
+    try:
+        result = source_figures.localize_source(
+            work.source, pages, output, runtime,
+            source_identity={
+                "manifest_source_sha256": work.manifest["source"].get("sha256"),
+                "work_id": work.work_id,
+            },
+            reuse=reuse,
+            artifact_root=work_temp(work),
+        )
+    except (ValueError, OSError) as error:
+        raise CliError(str(error)) from error
+    print(json.dumps(result, ensure_ascii=False))
+    return 1 if result.get("status") == "failed" else 0
+
 
 def reset_evidence_dir(work: Work, name: str) -> Path:
     target = evidence_dir(work, name)
@@ -3674,6 +4212,11 @@ def remove_empty_spans(root: ET.Element, class_name: str | None = None) -> int:
                 or "".join(child.itertext()).strip()
             ):
                 continue
+            epub_types = child.attrib.get(
+                f"{{{EPUB_NAMESPACE}}}type", child.attrib.get("epub:type", "")
+            ).split()
+            if "pagebreak" in epub_types:
+                continue
             if class_name and class_name not in child.attrib.get("class", "").split():
                 continue
             index = list(parent).index(child)
@@ -3702,44 +4245,6 @@ def remove_empty_spans(root: ET.Element, class_name: str | None = None) -> int:
                     parent.text = (parent.text or "") + tail
             parent.remove(child)
             removed += 1
-    return removed
-
-
-def remove_redundant_figure_captions(root: ET.Element) -> int:
-    """Remove Pandoc's visible caption when it only repeats an image alt."""
-    removed = 0
-    for figure in root.iter():
-        if figure.tag.rsplit("}", 1)[-1] != "figure":
-            continue
-        images = [
-            element
-            for element in figure.iter()
-            if element.tag.rsplit("}", 1)[-1] == "img"
-        ]
-        if len(images) != 1:
-            continue
-        alt = _normalize_caption_text(images[0].attrib.get("alt", ""))
-        if not alt:
-            continue
-        caption = next(
-            (
-                element
-                for element in figure
-                if element.tag.rsplit("}", 1)[-1] == "figcaption"
-            ),
-            None,
-        )
-        if caption is None or _normalize_caption_text("".join(caption.itertext())) != alt:
-            continue
-        index = list(figure).index(caption)
-        if caption.tail:
-            if index:
-                previous = list(figure)[index - 1]
-                previous.tail = (previous.tail or "") + caption.tail
-            else:
-                figure.text = (figure.text or "") + caption.tail
-        figure.remove(caption)
-        removed += 1
     return removed
 
 
@@ -3805,18 +4310,6 @@ def epub_structure_problems(root: ET.Element) -> list[str]:
                     else ""
                 )
                 if caption:
-                    image = next(
-                        (
-                            candidate
-                            for candidate in child.iter()
-                            if candidate.tag.rsplit("}", 1)[-1] == "img"
-                        ),
-                        None,
-                    )
-                    if image is not None and _normalize_caption_text(
-                        image.attrib.get("alt", "")
-                    ) == caption:
-                        problems.append(f"自动图注未移除：{caption}")
                     for sibling in children[index + 1 : index + 5]:
                         sibling_name = sibling.tag.rsplit("}", 1)[-1]
                         if sibling_name in {
@@ -3857,6 +4350,13 @@ def remove_empty_paragraphs(root: ET.Element) -> int:
                 continue
             if list(child) or "".join(child.itertext()).strip():
                 continue
+            if child.tail:
+                index = list(parent).index(child)
+                if index:
+                    previous = parent[index - 1]
+                    previous.tail = (previous.tail or "") + child.tail
+                else:
+                    parent.text = (parent.text or "") + child.tail
             parent.remove(child)
             removed += 1
     return removed
@@ -3950,29 +4450,6 @@ def add_epub_footnote_backlinks(root: ET.Element) -> int:
 
 
 def replace_navigation_formula_images(root: ET.Element) -> int:
-    symbols = {
-        "\\blacktriangleright": "▶",
-        "\\blacksquare": "■",
-        "\\mathcal L_A": "L_A",
-        "T_{\\mathrm{odl}}": "T_odl",
-        "T_{\\mathrm{BA}}^d": "T_BA^d",
-        "\\Pi_2": "Π₂",
-        "\\omega_1": "ω₁",
-        "T_{\\mathrm{dag}}": "T_dag",
-        "T_{\\mathrm{dag}}^1": "T_dag^1",
-        "T_{\\mathrm{odag}}": "T_odag",
-        "\\mathcal Z_0": "Z_0",
-        "T_{\\mathrm{pr}}": "T_pr",
-        "T_{\\mathrm{oasg}}^*": "T_oasg^*",
-        "\\Sigma_1": "Σ₁",
-        "T_{\\mathrm{PA}}": "T_PA",
-        "\\mathrm{PA}_f": "PA_f",
-        "\\delta": "δ",
-        "K^\\star=0": "K*=0",
-        "\\infty.1": "∞.1",
-        "\\infty.2.2": "∞.2.2",
-        "\\Pi_1": "Π₁",
-    }
     replaced = 0
     for parent in root.iter():
         for child in list(parent):
@@ -3982,11 +4459,10 @@ def replace_navigation_formula_images(root: ET.Element) -> int:
             if not classes.intersection(FORMULA_CLASSES):
                 continue
             alt = child.attrib.get("alt", "")
-            marker = alt.strip()
-            if "\\" in marker:
-                if marker not in symbols:
-                    raise CliError(f"导航公式无法安全转为文本：{marker}")
-                alt = symbols[marker]
+            try:
+                alt = epub_semantics.navigation_formula_text(alt)
+            except epub_semantics.EpubSemanticError as error:
+                raise CliError(str(error)) from error
             text = alt + (child.tail or "")
             index = list(parent).index(child)
             if index:
@@ -4020,11 +4496,22 @@ def repair_split_fragment_links(documents: dict[str, ET.Element]) -> int:
                 continue
             href = element.attrib.get("href", "")
             parsed = urllib.parse.urlsplit(href)
+            semantic_types = element.attrib.get(f"{{{EPUB_NAMESPACE}}}type", "").split()
+            if set(semantic_types) & {"noteref", "backlink"}:
+                # Do not sanitize malformed note URLs before strict note QA.
+                if re.search(r"%(?![0-9a-fA-F]{2})", href):
+                    continue
+                try:
+                    urllib.parse.unquote(parsed.fragment, errors="strict")
+                except UnicodeError:
+                    continue
             fragment = urllib.parse.unquote(parsed.fragment)
             if (
                 not fragment
                 or parsed.path
                 or parsed.scheme
+                or parsed.netloc
+                or parsed.query
                 or fragment in ids_by_member[member]
             ):
                 continue
@@ -4038,7 +4525,254 @@ def repair_split_fragment_links(documents: dict[str, ET.Element]) -> int:
     return repaired
 
 
-def normalize_epub_navigation(source: Path, output: Path) -> None:
+def add_explicit_bodymatter_landmark(
+    documents: dict[str, ET.Element], payloads: dict[str, bytes]
+) -> None:
+    """Derive a start-of-text link only from an explicit section in spine order."""
+    epub_type = f"{{{EPUB_NAMESPACE}}}type"
+    candidates = {
+        member: [
+            node
+            for node in document.iter()
+            if node.tag.rsplit("}", 1)[-1] in {"section", "div"}
+            and "bodymatter" in node.attrib.get(epub_type, "").split()
+        ]
+        for member, document in documents.items()
+    }
+    candidates = {member: nodes for member, nodes in candidates.items() if nodes}
+    if not candidates:
+        return
+    try:
+        container = ET.fromstring(payloads["META-INF/container.xml"])
+        opf_path = next(
+            node.attrib["full-path"]
+            for node in container.iter()
+            if node.tag.rsplit("}", 1)[-1] == "rootfile"
+        )
+        package = ET.fromstring(payloads[opf_path])
+        manifest = {
+            node.attrib["id"]: node
+            for node in package.iter()
+            if node.tag.rsplit("}", 1)[-1] == "item"
+        }
+        base = posixpath.dirname(opf_path)
+        spine = [
+            posixpath.normpath(
+                posixpath.join(base, manifest[node.attrib["idref"]].attrib["href"])
+            )
+            for node in package.iter()
+            if node.tag.rsplit("}", 1)[-1] == "itemref"
+        ]
+        nav_item = next(
+            node
+            for node in manifest.values()
+            if "nav" in node.attrib.get("properties", "").split()
+        )
+        nav_member = posixpath.normpath(posixpath.join(base, nav_item.attrib["href"]))
+        target_member = next(member for member in spine if member in candidates)
+        target_id = candidates[target_member][0].attrib.get("id", "")
+        if not target_id:
+            raise CliError("显式 bodymatter 正文起点必须有稳定 ID")
+        navigation = documents[nav_member]
+        namespace = navigation.tag.split("}", 1)[0] + "}"
+        landmarks = next(
+            (
+                node
+                for node in navigation.iter()
+                if node.tag.rsplit("}", 1)[-1] == "nav"
+                and "landmarks" in node.attrib.get(epub_type, "").split()
+            ),
+            None,
+        )
+        if landmarks is None:
+            body = next(
+                node
+                for node in navigation.iter()
+                if node.tag.rsplit("}", 1)[-1] == "body"
+            )
+            landmarks = ET.SubElement(
+                body, namespace + "nav", {epub_type: "landmarks", "hidden": "hidden"}
+            )
+        ordered_list = next(
+            (node for node in landmarks if node.tag.rsplit("}", 1)[-1] == "ol"), None
+        )
+        if ordered_list is None:
+            ordered_list = ET.SubElement(landmarks, namespace + "ol")
+        links = [
+            node
+            for node in landmarks.iter()
+            if node.tag.rsplit("}", 1)[-1] == "a"
+            and "bodymatter" in node.attrib.get(epub_type, "").split()
+        ]
+        if len(links) > 1:
+            raise CliError("landmarks 含多个 bodymatter 起点")
+        anchor = (
+            links[0]
+            if links
+            else ET.SubElement(
+                ET.SubElement(ordered_list, namespace + "li"),
+                namespace + "a",
+                {epub_type: "bodymatter"},
+            )
+        )
+        anchor.attrib["href"] = (
+            posixpath.relpath(target_member, posixpath.dirname(nav_member))
+            + "#"
+            + urllib.parse.quote(target_id)
+        )
+        anchor.text = (
+            "正文"
+            if navigation.attrib.get("lang", "").startswith("zh")
+            else "Start of content"
+        )
+    except (KeyError, StopIteration, ET.ParseError) as error:
+        raise CliError("无法从有效 OPF/spine 与显式 bodymatter 派生正文导航") from error
+
+
+def localize_generated_landmarks(document: ET.Element) -> None:
+    """Translate generated Chinese landmark labels without replacing custom copy."""
+    language = document.attrib.get(
+        "lang", document.attrib.get("{http://www.w3.org/XML/1998/namespace}lang", "")
+    )
+    if not language.lower().startswith("zh"):
+        return
+    epub_type = f"{{{EPUB_NAMESPACE}}}type"
+    labels = {"cover": ("cover", "封面"), "toc": ("table of contents", "目录")}
+    for navigation in document.iter():
+        if (
+            navigation.tag.rsplit("}", 1)[-1] != "nav"
+            or "landmarks" not in navigation.attrib.get(epub_type, "").split()
+        ):
+            continue
+        for anchor in navigation.iter():
+            if anchor.tag.rsplit("}", 1)[-1] != "a" or len(anchor):
+                continue
+            text = " ".join((anchor.text or "").split()).casefold()
+            for kind in anchor.attrib.get(epub_type, "").split():
+                if kind in labels and text == labels[kind][0]:
+                    anchor.text = labels[kind][1]
+
+
+def controlled_epub_toc_depth(work: Work) -> int | None:
+    epub = work.manifest.get("epub", {})
+    return epub.get("toc_depth", 3) if epub.get("title_page") is False else None
+
+
+def load_page_navigation(
+    work: Work, language: Language
+) -> epub_page_navigation.PageNavigationConfig | None:
+    try:
+        return epub_page_navigation.load_page_navigation_config(
+            work.path, work.manifest, language.code
+        )
+    except epub_page_navigation.PageNavigationError as error:
+        raise CliError(str(error)) from error
+
+
+def _ncx_members(
+    payloads: dict[str, bytes], manifest_items: Iterable[ET.Element], base: str,
+) -> set[str]:
+    members = {member for member in payloads if member.endswith(".ncx")}
+    members.update(
+        posixpath.normpath(posixpath.join(
+            base, urllib.parse.unquote(urllib.parse.urlsplit(item.attrib["href"]).path),
+        ))
+        for item in manifest_items
+        if item.attrib.get("media-type") == "application/x-dtbncx+xml"
+    )
+    return members
+
+
+def _validate_ncx_matches_nav(
+    payloads: dict[str, bytes], manifest_items: Iterable[ET.Element], base: str,
+    toc: ET.Element, nav_member: str,
+) -> None:
+    # An absent NCX is permitted; a declared or present one must match the nav.
+    for ncx_member in sorted(_ncx_members(payloads, manifest_items, base)):
+        if ncx_member not in payloads:
+            raise epub_semantics.EpubSemanticError(f"声明的 NCX 缺失：{ncx_member}")
+        try:
+            ncx = ET.fromstring(payloads[ncx_member])
+        except ET.ParseError as error:
+            raise epub_semantics.EpubSemanticError(f"NCX 无法解析：{ncx_member}") from error
+        epub_semantics.validate_ncx_matches_nav(
+            ncx, toc, ncx_path=ncx_member, nav_path=nav_member,
+        )
+
+
+def validate_generated_epub_semantics(
+    documents: dict[str, ET.Element],
+    payloads: dict[str, bytes],
+    source_document: dict[str, Any],
+    *,
+    toc_depth: int | None = None,
+    number_sections: bool = False,
+    navigation_math_labels: bool = False,
+    native_note_split_level: int | None = None,
+    native_note_title_overridden: bool = False,
+) -> None:
+    """Bind complete code and controlled navigation to the formal reader AST."""
+    container = ET.fromstring(payloads["META-INF/container.xml"])
+    package_path = next(
+        node.attrib["full-path"] for node in container.iter()
+        if node.tag.rsplit("}", 1)[-1] == "rootfile"
+    )
+    package = ET.fromstring(payloads[package_path])
+    base = posixpath.dirname(package_path)
+    manifest = {
+        node.attrib["id"]: node for node in package.iter()
+        if node.tag.rsplit("}", 1)[-1] == "item"
+    }
+    members = [
+        posixpath.normpath(posixpath.join(base, manifest[node.attrib["idref"]].attrib["href"]))
+        for node in package.iter() if node.tag.rsplit("}", 1)[-1] == "itemref"
+    ]
+    try:
+        epub_semantics.validate_code_records(
+            epub_semantics.canonical_code(source_document),
+            epub_semantics.code_from_xhtml(documents[member] for member in members),
+        )
+        epub_semantics.validate_teaching_spans(
+            epub_semantics.teaching_spans_from_ast(source_document),
+            epub_semantics.teaching_spans_from_xhtml(documents[member] for member in members),
+        )
+        if toc_depth is not None:
+            nav_items = [item for item in manifest.values()
+                         if "nav" in item.attrib.get("properties", "").split()]
+            if navigation_math_labels and len(nav_items) != 1:
+                raise CliError("EPUB 必须只有一个 nav 文档")
+            nav_item = next(iter(nav_items))
+            nav_member = posixpath.normpath(posixpath.join(base, nav_item.attrib["href"]))
+            tocs = [node for node in documents[nav_member].iter()
+                    if node.tag.rsplit("}", 1)[-1] == "nav"
+                    and "toc" in node.attrib.get(f"{{{EPUB_NAMESPACE}}}type", "").split()]
+            if len(tocs) != 1:
+                raise CliError("EPUB 必须只有一份章节 toc")
+            epub_semantics.validate_outline(
+                source_document, tocs[0], toc_depth=toc_depth,
+                nav_path=nav_member, documents=documents, spine_paths=members,
+                number_sections=number_sections, epub_identifiers=True,
+                navigation_math_labels=navigation_math_labels,
+                native_note_split_level=native_note_split_level,
+                native_note_title_overridden=native_note_title_overridden,
+            )
+            if navigation_math_labels:
+                _validate_ncx_matches_nav(payloads, manifest.values(), base, tocs[0], nav_member)
+    except epub_semantics.EpubSemanticError as error:
+        raise CliError(str(error)) from error
+
+
+def normalize_epub_navigation(
+    source: Path, output: Path, *,
+    page_navigation: epub_page_navigation.PageNavigationConfig | None = None,
+    source_document: dict[str, Any] | None = None,
+    toc_depth: int | None = None,
+    number_sections: bool = False,
+    bodymatter: str | None = None,
+    navigation_math_labels: bool = False,
+    native_note_split_level: int | None = None,
+    native_note_title_overridden: bool = False,
+) -> None:
     xhtml_namespace = "http://www.w3.org/1999/xhtml"
     ET.register_namespace("", xhtml_namespace)
     ET.register_namespace("epub", "http://www.idpf.org/2007/ops")
@@ -4050,30 +4784,89 @@ def normalize_epub_navigation(source: Path, output: Path) -> None:
         for member, data in payloads.items()
         if member.endswith(".xhtml")
     }
+    try:
+        epub_page_navigation.apply_page_navigation(documents, payloads, page_navigation)
+    except epub_page_navigation.PageNavigationError as error:
+        raise CliError(str(error)) from error
+    if source_document is not None and toc_depth is not None:
+        try:
+            # For a mathematical title containing a noteref, compare against
+            # the complete readable label before removing the proven callout.
+            if navigation_math_labels:
+                for member, document in documents.items():
+                    if member.endswith("nav.xhtml"):
+                        replace_navigation_formula_images(document)
+            for document in documents.values():
+                for node in document.iter():
+                    if (node.tag.rsplit("}", 1)[-1] == "nav"
+                            and "toc" in node.get(f"{{{EPUB_NAMESPACE}}}type", "").split()):
+                        epub_semantics.normalize_noteref_labels(
+                            source_document, node, toc_depth=toc_depth, number_sections=number_sections,
+                            navigation_math_labels=navigation_math_labels,
+                            allow_native_notes=native_note_split_level is not None,
+                        )
+            ncx_members = [member for member in payloads if member.endswith(".ncx")]
+            if navigation_math_labels:
+                container = ET.fromstring(payloads["META-INF/container.xml"])
+                package_path = next(node.attrib["full-path"] for node in container.iter()
+                                    if node.tag.rsplit("}", 1)[-1] == "rootfile")
+                package = ET.fromstring(payloads[package_path])
+                manifest_items = (node for node in package.iter() if node.tag.rsplit("}", 1)[-1] == "item")
+                ncx_members = sorted(_ncx_members(payloads, manifest_items, posixpath.dirname(package_path)))
+            for member in ncx_members:
+                if member not in payloads:
+                    raise epub_semantics.EpubSemanticError(f"声明的 NCX 缺失：{member}")
+                document = ET.fromstring(payloads[member])
+                if epub_semantics.normalize_noteref_labels(
+                    source_document, document, toc_depth=toc_depth,
+                    number_sections=number_sections, ncx=True,
+                    navigation_math_labels=navigation_math_labels,
+                    allow_native_notes=native_note_split_level is not None,
+                ):
+                    payloads[member] = ET.tostring(document, encoding="utf-8", xml_declaration=True)
+        except epub_semantics.EpubSemanticError as error:
+            raise CliError(str(error)) from error
     repair_split_fragment_links(documents)
+    try:
+        epub_footnotes.normalize_footnotes(documents)
+    except epub_footnotes.FootnoteError as error:
+        raise CliError(str(error)) from error
+    try:
+        epub_bodymatter.apply_declared_bodymatter(documents, bodymatter)
+    except epub_bodymatter.BodymatterError as error:
+        raise CliError(str(error)) from error
+    add_explicit_bodymatter_landmark(documents, payloads)
+    for document in documents.values():
+        localize_generated_landmarks(document)
+    for member, navigation in documents.items():
+        if member.endswith("nav.xhtml"):
+            replace_navigation_formula_images(navigation)
+        remove_empty_spans(
+            navigation,
+            None if member.endswith("nav.xhtml") else "source-page",
+        )
+        if not member.endswith("nav.xhtml"):
+            remove_empty_spans(navigation, "source-unit")
+            remove_empty_spans(navigation, "image-tail")
+        add_epub_code_theme_classes(navigation)
+        remove_empty_paragraphs(navigation)
+    if source_document is not None:
+        validate_generated_epub_semantics(
+            documents, payloads, source_document, toc_depth=toc_depth,
+            number_sections=number_sections, navigation_math_labels=navigation_math_labels,
+            native_note_split_level=native_note_split_level,
+            native_note_title_overridden=native_note_title_overridden,
+        )
+    try:
+        if page_navigation is not None:
+            epub_page_navigation.validate_page_navigation(documents, payloads, page_navigation)
+    except epub_page_navigation.PageNavigationError as error:
+        raise CliError(str(error)) from error
     with zipfile.ZipFile(output, "w") as normalized:
         for item in items:
             data = payloads[item.filename]
             if item.filename in documents:
-                navigation = documents[item.filename]
-                if item.filename.endswith("nav.xhtml"):
-                    replace_navigation_formula_images(navigation)
-                remove_empty_spans(
-                    navigation,
-                    None if item.filename.endswith("nav.xhtml") else "source-page",
-                )
-                if not item.filename.endswith("nav.xhtml"):
-                    remove_empty_spans(navigation, "source-unit")
-                    remove_empty_spans(navigation, "image-tail")
-                    remove_redundant_figure_captions(navigation)
-                add_epub_code_theme_classes(navigation)
-                add_epub_footnote_backlinks(navigation)
-                remove_empty_paragraphs(navigation)
-                data = ET.tostring(
-                    navigation,
-                    encoding="utf-8",
-                    xml_declaration=True,
-                )
+                data = ET.tostring(documents[item.filename], encoding="utf-8", xml_declaration=True)
             normalized.writestr(item, data)
 
 
@@ -4292,24 +5085,7 @@ def gladtex_formula_key(formula: str) -> str:
 
 
 def gladtex_alt_text(formula: str) -> str:
-    changed = True
-    while changed:
-        changed = False
-        for command in GLADTEX_FORMATTING_COMMANDS:
-            index = formula.find(command)
-            if index < 0 or (index > 0 and formula[index - 1] == "\\"):
-                continue
-            end = index + len(command)
-            if (
-                end >= len(formula)
-                or not command[-1].isalpha()
-                or not formula[end].isalpha()
-            ):
-                formula = (
-                    formula[:index] + " " + formula[index + len(command) :]
-                ).replace("  ", " ")
-                changed = True
-    return formula.strip()
+    return epub_semantics.gladtex_alt_text(formula)
 
 
 def svg_math_cache_dir(work_path: Path) -> Path:
@@ -4711,6 +5487,69 @@ def render_svg_math_ast(
     return formula_count
 
 
+def _unwrap_pure_title_source_units(document: dict[str, Any]) -> int:
+    """Expand title-only metadata containers before the EPUB JSON writer."""
+    count = 0
+
+    def visit(value: Any) -> None:
+        nonlocal count
+        if isinstance(value, dict):
+            if value.get("t") == "Div" and "source-unit" in value["c"][0][1]:
+                (identifier, classes, attributes), blocks = value["c"]
+                unit = dict(attributes).get("data-unit")
+                if unit is None or re.fullmatch(r"[0-9]+", unit) is None:
+                    raise CliError("source-unit Div requires a numeric data-unit")
+                if identifier or classes != ["source-unit"]:
+                    raise CliError("source-unit Div is metadata only; container ID or extra classes are not allowed")
+                if len(attributes) != 1:
+                    raise CliError("source-unit Div is metadata only; extra attributes are not allowed")
+                if len(blocks) != 1 or blocks[0].get("t") != "Header":
+                    raise CliError("source-unit Div must contain exactly one Header")
+                heading = blocks[0]
+                value.clear()
+                value.update(heading)
+                count += 1
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(document)
+    return count
+
+
+def native_note_writer_split_level(writer_options: list[str]) -> int:
+    """Use the same split option supplied to Pandoc (its EPUB default is 1)."""
+    value = "1"
+    for index, option in enumerate(writer_options):
+        if option.startswith("--split-level="):
+            value = option.partition("=")[2]
+        elif option == "--split-level":
+            if index + 1 >= len(writer_options):
+                raise CliError("原生标题注缺少 EPUB writer 拆分层级")
+            value = writer_options[index + 1]
+    if not value.isdigit() or not 1 <= int(value) <= 6:
+        raise CliError("原生标题注需要 EPUB writer 拆分层级 1--6")
+    return int(value)
+
+
+def native_note_writer_title_overridden(writer_options: list[str]) -> bool:
+    """Pandoc's explicit title metadata replaces a source title, including Notes."""
+    for index, option in enumerate(writer_options):
+        if option.startswith("--metadata="):
+            value = option.partition("=")[2]
+        elif option in {"--metadata", "-M"}:
+            value = writer_options[index + 1] if index + 1 < len(writer_options) else ""
+        elif option.startswith("-M"):
+            value = option[2:].lstrip("=")
+        else:
+            continue
+        if value.split(":", 1)[0].split("=", 1)[0] == "title":
+            return True
+    return False
+
+
 def build_svg_math_epub(
     *,
     root: Path,
@@ -4722,6 +5561,9 @@ def build_svg_math_epub(
     output: Path,
     source_epub: Path | None = None,
     seed_epub: Path | None = None,
+    page_navigation: epub_page_navigation.PageNavigationConfig | None = None,
+    toc_depth: int | None = None,
+    bodymatter: str | None = None,
 ) -> None:
     with tempfile.TemporaryDirectory(
         prefix="svg-epub-", dir=output.parent
@@ -4734,6 +5576,10 @@ def build_svg_math_epub(
             [*source_command, "--to=json", "-o", str(source_ast)],
             cwd=source_cwd,
         )
+        source_document = json.loads(source_ast.read_text(encoding="utf-8"))
+        native_split = (native_note_writer_split_level(writer_options)
+                        if toc_depth is not None and epub_semantics.has_native_heading_notes(source_document)
+                        else None)
         render_svg_math_ast(
             root,
             work_path,
@@ -4743,6 +5589,11 @@ def build_svg_math_epub(
             source_epub,
             seed_epub,
         )
+        writer_document = json.loads(filtered_ast.read_text(encoding="utf-8"))
+        if _unwrap_pure_title_source_units(writer_document):
+            filtered_ast.write_text(
+                json.dumps(writer_document, ensure_ascii=False), encoding="utf-8"
+            )
         resources = pandoc_resource_path(
             root,
             work_path,
@@ -4757,6 +5608,7 @@ def build_svg_math_epub(
                 "--from=json",
                 "--to=epub3",
                 "--standalone",
+                f"--lua-filter={root / 'formats/pandoc/epub-list-delimiters.lua'}",
                 f"--resource-path={resources}",
                 *writer_options,
                 "-o",
@@ -4764,7 +5616,17 @@ def build_svg_math_epub(
             ],
             cwd=temporary,
         )
-        normalize_epub_navigation(raw_epub, output)
+        normalize_epub_navigation(
+            raw_epub, output, page_navigation=page_navigation,
+            source_document=source_document,
+            toc_depth=toc_depth,
+            number_sections="--number-sections" in writer_options or "-N" in writer_options,
+            bodymatter=bodymatter,
+            navigation_math_labels=toc_depth is not None,
+            native_note_split_level=native_split,
+            native_note_title_overridden=(native_note_writer_title_overridden(writer_options)
+                                          if native_split is not None else False),
+        )
 
 
 def build_typst(work: Work, language: Language, target: str, output: Path) -> None:
@@ -4837,8 +5699,9 @@ def build_typst(work: Work, language: Language, target: str, output: Path) -> No
         ]
         writer_options = [
             "--toc",
-            "--toc-depth=3",
-            "--split-level=1",
+            *epub_structure_options(work),
+            *epub_navigation_options(language.code),
+            f"--split-level={epub_split_level(work.manifest.get('epub', {}).get('split_level'), default=1)}",
             f"--css={work.root / 'formats/epub/book.css'}",
             f"--metadata=title:{title}",
             f"--metadata=lang:{language.code}",
@@ -4859,6 +5722,9 @@ def build_typst(work: Work, language: Language, target: str, output: Path) -> No
             output=generated_epub,
             source_epub=work.source,
             seed_epub=language.outputs.get("epub"),
+            page_navigation=load_page_navigation(work, language),
+            toc_depth=controlled_epub_toc_depth(work),
+            bodymatter=work.manifest.get("epub", {}).get("bodymatter"),
         )
         shutil.copyfile(generated_epub, output)
 
@@ -4887,6 +5753,28 @@ def explicit_epub_cover_path(work: Work) -> Path | None:
     return None
 
 
+def epub_structure_options(work: Work) -> list[str]:
+    epub = work.manifest.get("epub", {})
+    options = [f"--toc-depth={epub.get('toc_depth', 3)}"]
+    if "title_page" in epub:
+        options.append(f"--epub-title-page={str(epub['title_page']).lower()}")
+    return options
+
+
+def epub_split_level(value: object, *, default: int) -> int:
+    if value is None:
+        return default
+    if type(value) is not int or not 1 <= value <= 6:
+        raise CliError("epub.split_level 必须是 1--6 的整数")
+    return value
+
+
+def epub_navigation_options(language: str) -> list[str]:
+    if language.lower().startswith("zh"):
+        return ["--metadata=toc-title:目录"]
+    return []
+
+
 def epub_cover_path(work: Work) -> Path | None:
     explicit = explicit_epub_cover_path(work)
     if explicit is not None:
@@ -4911,8 +5799,9 @@ def build_markdown(work: Work, language: Language, target: str, output: Path) ->
         date = epub_date(work)
         writer_options = [
             "--toc",
-            "--toc-depth=3",
-            "--split-level=2",
+            *epub_structure_options(work),
+            *epub_navigation_options(language.code),
+            f"--split-level={epub_split_level(work.manifest.get('epub', {}).get('split_level'), default=2)}",
             f"--css={work.root / 'formats/epub/book.css'}",
             f"--metadata=title:{title}",
             f"--metadata=identifier:{identifier}",
@@ -4934,6 +5823,9 @@ def build_markdown(work: Work, language: Language, target: str, output: Path) ->
             output=output,
             source_epub=work.source,
             seed_epub=language.outputs.get("epub"),
+            page_navigation=load_page_navigation(work, language),
+            toc_depth=controlled_epub_toc_depth(work),
+            bodymatter=work.manifest.get("epub", {}).get("bodymatter"),
         )
         return
     else:
@@ -4964,8 +5856,10 @@ def build_html(work: Work, language: Language, output: Path) -> None:
     output.write_text(text, encoding="utf-8")
 
 
-def latex_epub_source_text(entry: Path, work_path: Path) -> str:
-    return normalize_latex_source_page_lines(
+def latex_epub_source_text(
+    entry: Path, work_path: Path, *, native_caption_numbers: bool = False
+) -> str:
+    text = normalize_latex_source_page_lines(
         normalize_latex_counter_formats(
             normalize_latex_split_footnotes(
                 normalize_latex_layout_environments(
@@ -4974,6 +5868,7 @@ def latex_epub_source_text(entry: Path, work_path: Path) -> str:
             )
         )
     )
+    return normalize_latex_native_captions(text) if native_caption_numbers else text
 
 
 def latex_source_has_part(text: str) -> bool:
@@ -4984,7 +5879,8 @@ def latex_source_has_part(text: str) -> bool:
 
 
 def latex_epub_pandoc_command(
-    *, root: Path, work_path: Path, entry: Path, expanded: Path, has_part: bool = False
+    *, root: Path, work_path: Path, entry: Path, expanded: Path, has_part: bool = False,
+    native_caption_numbers: bool = False, language: str | None = None,
 ) -> list[str]:
     resource_path = os.pathsep.join((str(entry.parent), str(work_path), str(root)))
     command = [
@@ -4996,10 +5892,20 @@ def latex_epub_pandoc_command(
     ]
     if has_part:
         command.append("--metadata=translator-latex-has-part:true")
+    if native_caption_numbers:
+        labels = {"zh-CN": ("图", "表"), "en": ("Figure", "Table")}
+        if language not in labels:
+            raise CliError(f"LaTeX 原生图表编号不支持语言：{language}")
+        figure_label, table_label = labels[language]
+        command.extend([
+            f"--metadata=translator-latex-caption-figure:{figure_label}",
+            f"--metadata=translator-latex-caption-table:{table_label}",
+        ])
     return command
 
 
 def preflight_latex_epub(work: Work, language: Language) -> None:
+    native_caption_numbers = work.manifest.get("epub", {}).get("native_caption_numbers", False)
     with tempfile.TemporaryDirectory(
         prefix="latex-epub-preflight-",
         dir=temp_root(work.root),
@@ -5007,7 +5913,9 @@ def preflight_latex_epub(work: Work, language: Language) -> None:
         temporary = Path(directory)
         expanded = temporary / "expanded.tex"
         ast = temporary / "source.json"
-        source_text = latex_epub_source_text(language.entry, work.path)
+        source_text = latex_epub_source_text(
+            language.entry, work.path, native_caption_numbers=native_caption_numbers
+        )
         expanded.write_text(source_text, encoding="utf-8")
         run(
             [
@@ -5017,6 +5925,8 @@ def preflight_latex_epub(work: Work, language: Language) -> None:
                     entry=language.entry,
                     expanded=expanded,
                     has_part=latex_source_has_part(source_text),
+                    native_caption_numbers=native_caption_numbers,
+                    language=language.code,
                 ),
                 "--to=json",
                 "-o",
@@ -5039,6 +5949,12 @@ def build_latex_epub_source(
     cover: Path,
     date: str | None = None,
     seed_epub: Path | None = None,
+    structure_options: list[str] | None = None,
+    page_navigation: epub_page_navigation.PageNavigationConfig | None = None,
+    toc_depth: int | None = None,
+    bodymatter: str | None = None,
+    split_level: int | None = None,
+    native_caption_numbers: bool = False,
 ) -> None:
     entry = entry.resolve()
     cover = cover.resolve()
@@ -5058,7 +5974,9 @@ def build_latex_epub_source(
         temporary = Path(directory)
         expanded = temporary / "expanded.tex"
         normalized = temporary / "book.epub"
-        source_text = latex_epub_source_text(entry, work_path)
+        source_text = latex_epub_source_text(
+            entry, work_path, native_caption_numbers=native_caption_numbers
+        )
         expanded.write_text(source_text, encoding="utf-8")
         has_part = latex_source_has_part(source_text)
         command = latex_epub_pandoc_command(
@@ -5067,11 +5985,18 @@ def build_latex_epub_source(
             entry=entry,
             expanded=expanded,
             has_part=has_part,
+            native_caption_numbers=native_caption_numbers,
+            language=language,
         )
         writer_options = [
             "--toc",
-            "--toc-depth=3",
-            f"--split-level={2 if has_part else 1}",
+            *(
+                structure_options
+                if structure_options is not None
+                else ["--toc-depth=3"]
+            ),
+            *epub_navigation_options(language),
+            f"--split-level={epub_split_level(split_level, default=2 if has_part else 1)}",
             "--top-level-division=chapter",
             f"--css={root / 'formats/epub/book.css'}",
             f"--css={root / 'formats/epub/latex.css'}",
@@ -5095,6 +6020,9 @@ def build_latex_epub_source(
             source_cwd=work_path,
             output=normalized,
             seed_epub=seed_epub,
+            page_navigation=page_navigation,
+            toc_depth=toc_depth,
+            bodymatter=bodymatter,
         )
         shutil.copyfile(normalized, output)
 
@@ -5123,6 +6051,7 @@ def build_latex(work: Work, language: Language, target: str, output: Path) -> No
         title, author, identifier = epub_metadata(work, language)
         build_latex_epub_source(
             root=work.root,
+            structure_options=epub_structure_options(work),
             work_path=work.path,
             entry=language.entry,
             output=output,
@@ -5133,6 +6062,11 @@ def build_latex(work: Work, language: Language, target: str, output: Path) -> No
             cover=cover,
             date=epub_date(work),
             seed_epub=language.outputs.get("epub"),
+            page_navigation=load_page_navigation(work, language),
+            toc_depth=controlled_epub_toc_depth(work),
+            bodymatter=work.manifest.get("epub", {}).get("bodymatter"),
+            split_level=work.manifest.get("epub", {}).get("split_level"),
+            native_caption_numbers=work.manifest.get("epub", {}).get("native_caption_numbers", False),
         )
         return
 
@@ -5153,9 +6087,7 @@ def build_latex(work: Work, language: Language, target: str, output: Path) -> No
         build_dir = Path(directory)
         expanded = build_dir / language.entry.name
         expanded.write_text(
-            normalize_latex_source_page_lines(
-                expand_latex(language.entry, work.path)
-            ),
+            normalize_latex_source_page_lines(expand_latex(language.entry, work.path)),
             encoding="utf-8",
         )
         run(
@@ -5282,7 +6214,7 @@ def run_epubcheck(output: Path, evidence: Path) -> None:
             process_temp = str(temp_root())
             process_env["TEMP"] = process_temp
             process_env["TMP"] = process_temp
-            result = subprocess.run(
+            result = run_hidden(
                 command,
                 env=process_env,
                 text=True,
@@ -5323,6 +6255,37 @@ def epub_toc_outline(toc: ET.Element) -> str:
     if root is not None:
         visit(root, 1)
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+def validate_markdown_epub_outline(
+    work: Work, language: Language, toc: ET.Element, *,
+    nav_path: str | None = None,
+    documents: dict[str, ET.Element] | None = None,
+    spine_paths: list[str] | None = None,
+    navigation_math_labels: bool = False,
+) -> None:
+    """Preserve the old call while checking the complete controlled title tree."""
+    if (
+        work.authoring_format != "markdown"
+        or work.manifest.get("epub", {}).get("title_page") is not False
+    ):
+        return
+    document = _pandoc_boundary_ast(
+        work, language.entry.read_text(encoding="utf-8"), "markdown"
+    )
+    try:
+        epub_semantics.validate_outline(
+            document, toc, toc_depth=work.manifest["epub"].get("toc_depth", 3),
+            nav_path=nav_path, documents=documents, spine_paths=spine_paths,
+            epub_identifiers=True, navigation_math_labels=navigation_math_labels,
+            native_note_split_level=(
+                epub_split_level(work.manifest.get("epub", {}).get("split_level"), default=2)
+                if epub_semantics.has_native_heading_notes(document) else None
+            ),
+            native_note_title_overridden=epub_semantics.has_native_heading_notes(document),
+        )
+    except epub_semantics.EpubSemanticError as error:
+        raise CliError(str(error)) from error
 
 
 def svg_source_identity(data: bytes) -> str:
@@ -5378,6 +6341,10 @@ def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> Non
         missing = sorted(required - set(names))
         if missing:
             raise CliError(f"EPUB 缺少容器文件：{', '.join(missing)}")
+        if work.manifest.get("epub", {}).get("title_page") is False and any(
+            posixpath.basename(name) == "title_page.xhtml" for name in names
+        ):
+            raise CliError("EPUB 已关闭自动书名页，但成品仍含 title_page.xhtml")
         try:
             container = ET.fromstring(archive.read("META-INF/container.xml"))
             rootfile = next(
@@ -5521,6 +6488,8 @@ def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> Non
         if not toc_navs:
             raise CliError(f"EPUB 导航缺少 toc nav：{output}")
         toc_outline = epub_toc_outline(toc_navs[0])
+        if len(toc_navs) != 1:
+            raise CliError("EPUB 必须只有一份章节 toc")
         if not toc_outline:
             raise CliError(f"EPUB toc nav 没有可审阅的层级：{output}")
         if any(
@@ -5601,35 +6570,53 @@ def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> Non
                     formula_references.append(image_member)
                     if media_type == "image/svg+xml":
                         formula_svg_references.append(image_member)
-                footnotes = {
-                    element.attrib["id"]: element
-                    for element in document.iter()
-                    if element.tag.rsplit("}", 1)[-1] == "aside"
-                    and "footnote" in element.attrib.get(epub_type, "").split()
-                    and element.get("id")
-                }
-                for element in document.iter():
-                    if (
-                        element.tag.rsplit("}", 1)[-1] != "a"
-                        or "noteref" not in element.attrib.get(epub_type, "").split()
-                    ):
-                        continue
-                    parsed = urllib.parse.urlsplit(element.attrib.get("href", ""))
-                    footnote_id = urllib.parse.unquote(parsed.fragment)
-                    reference_id = element.get("id")
-                    footnote = footnotes.get(footnote_id)
-                    if parsed.path or footnote is None or not reference_id:
-                        raise CliError(f"EPUB 脚注链接无有效目标：{member}")
-                    if not any(
-                        child.tag.rsplit("}", 1)[-1] == "a"
-                        and "backlink" in child.attrib.get(epub_type, "").split()
-                        and child.attrib.get("href") == f"#{reference_id}"
-                        for child in footnote.iter()
-                    ):
-                        raise CliError(f"EPUB 脚注缺少返回正文链接：{member}")
                 documents[member] = document
             except (ET.ParseError, KeyError) as error:
                 raise CliError(f"EPUB 正文文档无效：{member}") from error
+        try:
+            epub_footnotes.validate_footnotes(documents)
+        except epub_footnotes.FootnoteError as error:
+            raise CliError(str(error)) from error
+        try:
+            epub_bodymatter.validate_declared_bodymatter(
+                documents, work.manifest.get("epub", {}).get("bodymatter"), nav_member
+            )
+        except epub_bodymatter.BodymatterError as error:
+            raise CliError(str(error)) from error
+        validate_markdown_epub_outline(
+            work, language, toc_navs[0], nav_path=nav_member, documents=documents,
+            spine_paths=[member_for(manifest_by_id[item].attrib["href"]) for item in spine_ids],
+            navigation_math_labels=True,
+        )
+        try:
+            payloads = {name: archive.read(name) for name in archive.namelist()}
+            if work.authoring_format == "markdown" and controlled_epub_toc_depth(work) is not None:
+                if len(nav_items) != 1:
+                    raise CliError("EPUB 必须只有一个 nav 文档")
+                _validate_ncx_matches_nav(payloads, manifest, posixpath.dirname(opf_path), toc_navs[0], nav_member)
+            epub_page_navigation.validate_page_navigation(
+                documents, payloads, load_page_navigation(work, language)
+            )
+            if work.authoring_format == "markdown":
+                document = _pandoc_boundary_ast(
+                    work, language.entry.read_text(encoding="utf-8"), "markdown"
+                )
+                epub_semantics.validate_code_records(
+                    epub_semantics.canonical_code(document),
+                    epub_semantics.code_from_xhtml(
+                        documents[member_for(manifest_by_id[item].attrib["href"])]
+                        for item in spine_ids
+                    ),
+                )
+                epub_semantics.validate_teaching_spans(
+                    epub_semantics.teaching_spans_from_ast(document),
+                    epub_semantics.teaching_spans_from_xhtml(
+                        documents[member_for(manifest_by_id[item].attrib["href"])]
+                        for item in spine_ids
+                    ),
+                )
+        except (epub_semantics.EpubSemanticError, epub_page_navigation.PageNavigationError) as error:
+            raise CliError(str(error)) from error
         source_svg_identities: set[str] | None = None
         for member in sorted(set(formula_svg_references)):
             try:
@@ -5746,6 +6733,9 @@ def command_qa(args: argparse.Namespace) -> int:
 
 
 def command_browser_qa(args: argparse.Namespace) -> int:
+    members = getattr(args, "members", None)
+    if members is not None and not members:
+        raise CliError("--member 必须包含至少一个包内 XHTML 路径")
     work = load_command_work(args)
     jobs = select_jobs(work, args.lang, "epub")
     record_selected_jobs(args, jobs)
@@ -5760,25 +6750,28 @@ def command_browser_qa(args: argparse.Namespace) -> int:
             re.sub(r"[^A-Za-z0-9._-]", "_", language.code),
             create=False,
         )
-        result = run(
-            [
-                sys.executable,
-                str(REPO_ROOT / "tools" / "epub_browser_qa.py"),
-                str(output),
-                "--evidence",
-                str(evidence),
-                "--width",
-                str(args.width),
-                "--height",
-                str(args.height),
-                "--timeout",
-                str(args.timeout),
-                "--page-timeout",
-                str(args.page_timeout),
-                "--screenshots",
-                str(args.screenshots),
-            ]
-        )
+        command = [
+            sys.executable,
+            str(REPO_ROOT / "tools" / "epub_browser_qa.py"),
+            str(output),
+            "--evidence",
+            str(evidence),
+            "--width",
+            str(args.width),
+            "--height",
+            str(args.height),
+            "--timeout",
+            str(args.timeout),
+            "--page-timeout",
+            str(args.page_timeout),
+            "--screenshots",
+            str(args.screenshots),
+            "--screenshot-policy",
+            getattr(args, "screenshot_policy", "failures"),
+        ]
+        for member in members or []:
+            command.extend(["--member", member])
+        result = run(command)
         print(result.stdout.strip())
         print(f"browser-qa: {output} -> {evidence}")
     return 0
@@ -5891,6 +6884,15 @@ def browser_acceptance_receipt(directory: Path, output: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as error:
         raise CliError(f"浏览器验收结果无效：{path}") from error
     digest = sha256(output)
+    try:
+        with zipfile.ZipFile(output) as archive:
+            available = sorted(
+                name for name in archive.namelist() if name.lower().endswith(".xhtml")
+            )
+    except (OSError, zipfile.BadZipFile) as error:
+        raise CliError(f"无法读取正式 EPUB 清单：{output}") from error
+    if not available:
+        raise CliError("正式 EPUB 不含 XHTML")
     names = set(epub_browser_qa.DEFAULT_MODE_NAMES)
     modes = result.get("modes", []) if isinstance(result, dict) else []
     if (
@@ -5901,8 +6903,21 @@ def browser_acceptance_receipt(directory: Path, output: Path) -> dict[str, Any]:
         or result.get("mode_count") != 3
         or result.get("failures") != []
         or str(result.get("sha256")).upper() != digest
+        or result.get("xhtml_count") != len(available)
     ):
         raise CliError("finalize 要求同一成品哈希的完整浏览器模式矩阵")
+    coverage = result.get("coverage")
+    if "coverage" in result and (
+        not isinstance(coverage, dict)
+        or coverage.get("kind") != "full"
+        or coverage.get("available_members") != available
+        or coverage.get("selected_members") != available
+        or coverage.get("unselected_members") != []
+        or coverage.get("checked_members") != available
+        or coverage.get("unchecked_members") != []
+        or result.get("total_xhtml_checks") != len(available) * len(names)
+    ):
+        raise CliError("finalize 要求覆盖正式 EPUB 全部 XHTML 的浏览器结果")
     compact = []
     expected_settings = {mode["name"]: mode for mode in epub_browser_qa.default_modes()}
     count_keys = (
@@ -5922,6 +6937,7 @@ def browser_acceptance_receipt(directory: Path, output: Path) -> dict[str, Any]:
             or not isinstance(mode.get("xhtml_count"), int)
             or mode["xhtml_count"] < 1
             or mode["xhtml_count"] != result.get("xhtml_count")
+            or ("coverage" in result and mode.get("checked_members") != available)
             or mode.get("settings") != expected_settings[mode["mode"]]
             or mode.get("viewport") != expected_settings[mode["mode"]]["viewport"]
             or any(
@@ -5932,6 +6948,7 @@ def browser_acceptance_receipt(directory: Path, output: Path) -> dict[str, Any]:
         keys = ("mode", "settings", "viewport", "sha256", *count_keys)
         compact.append({key: mode.get(key) for key in keys})
     return {"status": "passed", "results_sha256": sha256(path), "modes": compact}
+
 
 def load_current_final_summary(work: Work) -> tuple[Path, dict[str, Any]]:
     path = owned_child(evidence_dir(work, "final"), "final.json", "final receipt")
@@ -6286,6 +7303,85 @@ def write_refresh_summary(
     return summary
 
 
+def markdown_protected_literals(text: str) -> list[tuple[str, str]]:
+    parsed = json.loads(
+        run(
+            [
+                "pandoc",
+                "--from=markdown+fenced_divs+bracketed_spans+footnotes-raw_html",
+                "--to=json",
+            ],
+            input_text=text,
+        ).stdout
+    )
+    literals: list[tuple[str, str]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, dict):
+            if value.get("t") in {"Code", "CodeBlock", "Math"}:
+                literals.append((value["t"], value["c"][-1]))
+            for child in value.values():
+                visit(child)
+
+    visit(parsed)
+    return literals
+
+
+def protect_markdown_attributes(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Keep native machine attributes out of prose typography corrections."""
+    attribute = re.compile(
+        r"""\{(?:[^{}"'\\\x60]|\\.|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')*\}"""
+    )
+    prefix = "translatorAttributePlaceholder"
+    while prefix in text:
+        prefix += "X"
+    protected: list[tuple[str, str]] = []
+
+    def mask(match: re.Match[str]) -> str:
+        original = match.group()
+        body = original[1:-1]
+        if not re.match(r"\s*(?:[#.][^\s{}]+|[\w:][\w.:-]*\s*=|-(?=\s|$))", body):
+            return original
+        token = "{#" + prefix + str(len(protected)) + "Z}"
+        protected.append((token, original))
+        return token
+
+    return attribute.sub(mask, text), protected
+
+
+def autocorrect_markdown(entry: Path, *, fix: bool) -> None:
+    """Format explicit private files without Git-ignore skips or stdout progress."""
+    source = entry.read_text(encoding="utf-8")
+    typography, attributes = protect_markdown_attributes(source)
+    result = run(
+        [
+            "autocorrect",
+            "--quiet",
+            "--stdin",
+            "--type",
+            "markdown",
+            "--fix" if fix else "--lint",
+        ],
+        input_text=typography,
+    )
+    if fix:
+        if source.strip() and not result.stdout.strip():
+            raise CliError(f"AutoCorrect 对非空底稿返回空正文：{entry}")
+        formatted = result.stdout
+        for token, original in attributes:
+            if formatted.count(token) != 1:
+                raise CliError(f"AutoCorrect 改动原生属性占位符，正式底稿未写入：{entry}")
+            formatted = formatted.replace(token, original)
+        if formatted != source and markdown_protected_literals(
+            source
+        ) != markdown_protected_literals(formatted):
+            raise CliError(f"AutoCorrect 改动代码或公式字面量，正式底稿未写入：{entry}")
+        entry.write_text(formatted, encoding="utf-8")
+
+
 def command_prepare(args: argparse.Namespace) -> int:
     steps: list[dict[str, Any]] = []
     args._workflow_steps = steps
@@ -6300,12 +7396,12 @@ def command_prepare(args: argparse.Namespace) -> int:
     for entry in entries:
         workflow_step(
             f"autocorrect-fix:{entry.relative_to(work.root).as_posix()}",
-            lambda entry=entry: run(["autocorrect", "--fix", str(entry)]),
+            lambda entry=entry: autocorrect_markdown(entry, fix=True),
             steps,
         )
         workflow_step(
             f"autocorrect-lint:{entry.relative_to(work.root).as_posix()}",
-            lambda entry=entry: run(["autocorrect", "--lint", str(entry)]),
+            lambda entry=entry: autocorrect_markdown(entry, fix=False),
             steps,
         )
     workflow_step(
@@ -6318,6 +7414,9 @@ def command_prepare(args: argparse.Namespace) -> int:
 
 
 def command_refresh(args: argparse.Namespace) -> int:
+    members = getattr(args, "members", None)
+    if members is not None and args.target != "epub":
+        raise CliError("--member 仅适用于 EPUB refresh")
     steps: list[dict[str, Any]] = []
     args._workflow_steps = steps
     work = load_command_work(args)
@@ -6361,6 +7460,7 @@ def command_refresh(args: argparse.Namespace) -> int:
                 argparse.Namespace(
                     work=args.work,
                     lang=args.lang,
+                    members=members,
                     **BROWSER_QA_DEFAULTS,
                 )
             ),
@@ -6376,6 +7476,12 @@ def command_refresh(args: argparse.Namespace) -> int:
 
 
 def command_finalize(args: argparse.Namespace) -> int:
+    browser_timeout = getattr(args, "browser_timeout", BROWSER_QA_DEFAULTS["timeout"])
+    browser_page_timeout = getattr(args, "browser_page_timeout", BROWSER_QA_DEFAULTS["page_timeout"])
+    for option, value in (("--browser-timeout", browser_timeout),
+                          ("--browser-page-timeout", browser_page_timeout)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise CliError(f"{option} 必须是正整数")
     steps: list[dict[str, Any]] = []
     args._workflow_steps = steps
     work = load_command_work(args)
@@ -6421,7 +7527,8 @@ def command_finalize(args: argparse.Namespace) -> int:
                 argparse.Namespace(
                     work=args.work,
                     lang="all",
-                    **BROWSER_QA_DEFAULTS,
+                    **(BROWSER_QA_DEFAULTS | {"timeout": browser_timeout,
+                                            "page_timeout": browser_page_timeout}),
                 )
             ),
             steps,
@@ -6792,7 +7899,11 @@ def manifest_text(
     target_languages: list[str],
     targets: tuple[str, ...],
     source_units: bool = False,
+    source_file_size: int | None = None,
 ) -> str:
+    source_size = (
+        source.stat().st_size if source_file_size is None else source_file_size
+    )
     extension = {"typst": "typ", "markdown": "md", "html": "html", "latex": "tex"}[
         format_name
     ]
@@ -6810,14 +7921,20 @@ def manifest_text(
         f"sha256 = {quote_toml(digest)}",
     ]
     if source_units:
-        lines.extend(['format = "epub"', 'units = "source-units.tsv"', f"file_size_bytes = {source.stat().st_size}"])
+        lines.extend(
+            [
+                'format = "epub"',
+                'units = "source-units.tsv"',
+                f"file_size_bytes = {source_size}",
+            ]
+        )
     elif anchor_pages is None:
         lines.extend(
             [
                 "",
                 "[pdf]",
                 f"pages = {pages}",
-                f"file_size_bytes = {source.stat().st_size}",
+                f"file_size_bytes = {source_size}",
             ]
         )
     else:
@@ -6827,7 +7944,7 @@ def manifest_text(
                 f"pages = {pages}",
                 f"anchor_pages = {len(anchor_pages)}",
                 f"anchor_set = {quote_toml(compress_page_spec(anchor_pages))}",
-                f"file_size_bytes = {source.stat().st_size}",
+                f"file_size_bytes = {source_size}",
             ]
         )
     lines.extend(["", "[authoring]", f"format = {quote_toml(format_name)}"])
@@ -6862,10 +7979,14 @@ def command_init(args: argparse.Namespace) -> int:
     root = REPO_ROOT
     raw_source = Path(args.source)
     source = (raw_source if raw_source.is_absolute() else root / raw_source).resolve()
+    import_source = getattr(args, "import_source", False)
     try:
         source.relative_to(root)
     except ValueError as error:
-        raise CliError(f"来源必须位于仓库内：{source}") from error
+        if not import_source:
+            raise CliError(
+                f"来源必须位于仓库内；外部只读来源请显式使用 --import-source：{source}"
+            ) from error
     if not source.is_file():
         raise CliError(f"来源不存在：{source}")
     if source.suffix.lower() not in {".pdf", ".epub"}:
@@ -6909,12 +8030,17 @@ def command_init(args: argparse.Namespace) -> int:
         else:
             pages = len(unit_rows)
             if args.format not in {"markdown", "html"}:
-                raise CliError("没有固定页码的 EPUB 请使用 --format markdown 或 html；当前格式不支持 source-unit")
+                raise CliError(
+                    "没有固定页码的 EPUB 请使用 --format markdown 或 html；当前格式不支持 source-unit"
+                )
     digest = sha256(source)
+    manifest_source = (
+        work_path / "assets" / "source" / source.name if import_source else source
+    )
     content = manifest_text(
         work_id=args.id,
         title=args.title,
-        source=source,
+        source=manifest_source,
         root=root,
         digest=digest,
         pages=pages,
@@ -6924,17 +8050,28 @@ def command_init(args: argparse.Namespace) -> int:
         target_languages=target_languages,
         targets=targets,
         source_units=bool(unit_rows),
+        source_file_size=source.stat().st_size,
     )
     extension = {"typst": "typ", "markdown": "md", "html": "html", "latex": "tex"}[
         args.format
     ]
+    created = False
     try:
         work_path.mkdir(parents=True)
+        created = True
         (work_path / "assets").mkdir()
         (work_path / "output").mkdir()
+        if import_source:
+            manifest_source.parent.mkdir()
+            shutil.copyfile(source, manifest_source)
         (work_path / "manifest.toml").write_text(content, encoding="utf-8")
         (work_path / "STATUS.md").write_text(
-            f"# 《{args.title}》工作状态\n\n状态：planned\n\n已初始化，尚未开始来源视觉核对。\n",
+            f"# 《{args.title}》工作状态\n\n状态：planned\n\n已初始化，尚未开始来源视觉核对。\n"
+            + (
+                f"\n来源原路径：`{source}`；只读导入 `assets/source/{source.name}`，原文件未修改。\n"
+                if import_source
+                else ""
+            ),
             encoding="utf-8",
         )
         mapping_name = "source-units.tsv" if unit_rows else "page-map.tsv"
@@ -6965,7 +8102,7 @@ def command_init(args: argparse.Namespace) -> int:
                         GLOSSARY_HEADER
                     )
     except BaseException:
-        if work_path.exists():
+        if created and work_path.exists():
             shutil.rmtree(work_path)
         raise
     print(f"initialized: {work_path}")
@@ -6975,6 +8112,16 @@ def command_init(args: argparse.Namespace) -> int:
 def command_station(_args: argparse.Namespace) -> int:
     print("station: ok")
     return 0
+
+
+def positive_browser_timeout(value: str) -> int:
+    try:
+        timeout = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("必须是正整数") from error
+    if timeout < 1:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return timeout
 
 
 def station_label(value: str) -> str:
@@ -7021,6 +8168,11 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--id", required=True)
     init.add_argument("--title", required=True)
     init.add_argument("--work")
+    init.add_argument(
+        "--import-source",
+        action="store_true",
+        help="将只读来源复制到新作品 assets/source，不修改原文件",
+    )
     init.add_argument("--source-lang", default="en")
     init.add_argument("--target-lang", action="append")
     init.add_argument("--format", choices=sorted(FORMATS), default="typst")
@@ -7085,9 +8237,7 @@ def parser() -> argparse.ArgumentParser:
     browser_qa.add_argument("work")
     browser_qa.add_argument("--lang", default="all")
     browser_qa.add_argument("--width", type=int, default=BROWSER_QA_DEFAULTS["width"])
-    browser_qa.add_argument(
-        "--height", type=int, default=BROWSER_QA_DEFAULTS["height"]
-    )
+    browser_qa.add_argument("--height", type=int, default=BROWSER_QA_DEFAULTS["height"])
     browser_qa.add_argument(
         "--timeout", type=int, default=BROWSER_QA_DEFAULTS["timeout"]
     )
@@ -7097,6 +8247,11 @@ def parser() -> argparse.ArgumentParser:
     browser_qa.add_argument(
         "--screenshots", type=int, default=BROWSER_QA_DEFAULTS["screenshots"]
     )
+    browser_qa.add_argument(
+        "--screenshot-policy", choices=("failures", "representative"), default="failures"
+    )
+    browser_qa.add_argument("--member", action="append", dest="members",
+                            help="精确包内 XHTML 路径；可重复，仅检查所选成员")
     add_station_arguments(browser_qa)
     browser_qa.set_defaults(handler=command_browser_qa)
 
@@ -7123,14 +8278,28 @@ def parser() -> argparse.ArgumentParser:
     refresh = commands.add_parser("refresh", help="增量重建并验收所选输出")
     refresh.add_argument("work")
     refresh.add_argument("--lang", required=True)
-    refresh.add_argument(
-        "--target", required=True, choices=("html", "epub", "pdf")
-    )
+    refresh.add_argument("--target", required=True, choices=("html", "epub", "pdf"))
+    refresh.add_argument("--member", action="append", dest="members",
+                         help="仅 EPUB：缩小浏览器检查范围，构建和静态 QA 不变")
     add_station_arguments(refresh)
     refresh.set_defaults(handler=command_refresh)
 
     finalize = commands.add_parser("finalize", help="运行最终机械验收链")
     finalize.add_argument("work")
+    finalize.add_argument(
+        "--browser-timeout",
+        type=positive_browser_timeout,
+        default=BROWSER_QA_DEFAULTS["timeout"],
+        metavar="SECONDS",
+        help="浏览器每模式整体超时秒数（默认：%(default)s）",
+    )
+    finalize.add_argument(
+        "--browser-page-timeout",
+        type=positive_browser_timeout,
+        default=BROWSER_QA_DEFAULTS["page_timeout"],
+        metavar="SECONDS",
+        help="浏览器单页加载超时秒数（默认：%(default)s）",
+    )
     add_station_arguments(finalize)
     finalize.set_defaults(handler=command_finalize)
 
@@ -7139,9 +8308,7 @@ def parser() -> argparse.ArgumentParser:
     )
     deliver.add_argument("work")
     deliver.add_argument("--lang", required=True)
-    deliver.add_argument(
-        "--target", required=True, choices=("html", "epub", "pdf")
-    )
+    deliver.add_argument("--target", required=True, choices=("html", "epub", "pdf"))
     deliver.add_argument("--to", required=True, type=Path)
     add_station_arguments(deliver)
     deliver.set_defaults(handler=command_deliver)
@@ -7159,17 +8326,41 @@ def parser() -> argparse.ArgumentParser:
     add_station_arguments(scratch)
     scratch.set_defaults(handler=command_scratch)
 
-    source_probe_parser = commands.add_parser("source-probe", help="完整探查 EPUB 来源结构，在 scratch 保存报告")
+    handoff = commands.add_parser("handoff-check", help="合入前检查显式 Markdown 章节交接包")
+    handoff.add_argument("work")
+    handoff.add_argument("--lang", required=True)
+    handoff.add_argument("--root", help="本书 Works 或 scratch 内的交接根，默认作品目录")
+    handoff.add_argument("--package", required=True, help="交接根下的 JSON 相对路径")
+    handoff.add_argument("--scope-file", required=True, help="主 Agent 受控章节声明的 JSON 相对路径")
+    add_station_arguments(handoff)
+    handoff.set_defaults(handler=command_handoff_check)
+
+    source_probe_parser = commands.add_parser(
+        "source-probe", help="完整探查 EPUB 来源结构，在 scratch 保存报告"
+    )
     source_probe_parser.add_argument("work")
     source_probe_parser.add_argument("--agent", required=True)
     add_station_arguments(source_probe_parser)
     source_probe_parser.set_defaults(handler=command_source_probe)
 
-    source_draft = commands.add_parser("source-draft", help="先探查并检查信息保全，再生成 EPUB 草稿，仍需视觉核定")
+    source_draft = commands.add_parser(
+        "source-draft", help="先探查并检查信息保全，再生成 EPUB 草稿，仍需视觉核定"
+    )
     source_draft.add_argument("work")
     source_draft.add_argument("--agent", required=True)
     add_station_arguments(source_draft)
     source_draft.set_defaults(handler=command_source_draft)
+
+    source_figures_parser = commands.add_parser(
+        "source-figures", help="按原生来源与图注定位 PDF 图形候选，不修改正式书籍"
+    )
+    source_figures_parser.add_argument("work")
+    source_figures_parser.add_argument("--pages", required=True, help="PDF 物理页，例如 3,8-10")
+    source_figures_parser.add_argument("--agent", required=True)
+    source_figures_parser.add_argument("--runtime", required=True, help="本机图形工具 runtime TOML 配置")
+    source_figures_parser.add_argument("--reuse", help="同一作品 scratch 中的既有报告")
+    add_station_arguments(source_figures_parser)
+    source_figures_parser.set_defaults(handler=command_source_figures)
 
     clean = commands.add_parser("clean", help="清理该书临时证据，保留终态和交付回执")
     clean.add_argument("work")

@@ -7,6 +7,7 @@ body {
   box-sizing: border-box;
   padding-inline: 0.25em;
   overflow-wrap: anywhere;
+  text-spacing-trim: space-all;
 }
 
 h1,
@@ -39,7 +40,7 @@ p {
   box-sizing: border-box;
   padding-inline-end: 0.25em;
   overflow-wrap: anywhere;
-  word-break: break-all;
+  word-break: normal;
 }
 
 [id="索引"] p {
@@ -65,6 +66,16 @@ li > p {
   text-indent: 0;
 }
 
+@counter-style translator-decimal-two-parens {
+  system: extends decimal;
+  prefix: "(";
+  suffix: ") ";
+}
+
+div.translator-list-decimal-two-parens > ol > li {
+  list-style-type: translator-decimal-two-parens;
+}
+
 blockquote,
 .learning-points,
 .exercise,
@@ -88,6 +99,20 @@ figure {
   text-align: center;
 }
 
+/* Block figures contain prose and rules, not just a centered image. */
+figure.native-figure[data-figure-body="blocks"] {
+  text-align: start;
+}
+
+/* Keep wide rule rows readable without stretching the whole page. */
+figure.native-figure[data-figure-body="blocks"] div.display-formula {
+  overflow-x: auto;
+}
+
+figure.native-figure[data-figure-body="blocks"] img.math-display {
+  max-width: none;
+}
+
 img {
   max-width: 100%;
   height: auto;
@@ -107,7 +132,56 @@ nav li {
 
 nav a {
   overflow-wrap: anywhere;
-  word-break: break-all;
+  word-break: normal;
+}
+
+/* Navigation labels carry the source numbering; do not add a second sequence. */
+nav ol {
+  list-style: none;
+  padding-inline-start: 1.25em;
+}
+
+section.titlepage,
+div.titlepage {
+  margin: 3em 1em;
+  text-align: center;
+}
+
+.titlepage p {
+  text-indent: 0;
+}
+
+.book-title,
+.book-subtitle,
+.book-authors {
+  display: block;
+}
+
+.book-title,
+section.titlepage > h1 {
+  font-size: 2em;
+  font-weight: bold;
+  margin-block: 1.5em 0.5em;
+}
+
+.book-subtitle {
+  font-size: 1.2em;
+  margin-block: 0.5em 2em;
+}
+
+.book-authors {
+  margin-block: 1em;
+}
+
+.book-imprint {
+  display: block;
+  margin-block-start: 2em;
+  font-size: 0.9em;
+}
+
+section.titlepage > h1 {
+  border: 0;
+  padding: 0;
 }
 
 .display-formula,
@@ -124,6 +198,11 @@ p > .inline-formula:only-child > img {
   display: block;
   max-width: 100%;
   margin-inline: auto;
+}
+
+/* Keep generated displays at their relative size; scroll only this object. */
+.display-formula {
+  overflow-x: auto;
 }
 
 p > img:not(.math-inline):not(.math-display):only-child {
@@ -160,6 +239,23 @@ table {
   max-width: 100%;
 }
 
+/* Opt in only for data tables whose field identities must not be split. */
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.table-scroll table,
+.table-scroll table * {
+  overflow-wrap: normal;
+  word-break: keep-all;
+}
+
+/* Literal identifiers keep their original hyphens without introducing breaks. */
+.table-scroll .table-token {
+  white-space: nowrap;
+}
+
 /* Data Analytics 2025: the 12-column Iris table must remain readable on narrow screens. */
 #u004-Tab1 table,
 #u004-Tab2 table {
@@ -188,8 +284,8 @@ th {
 
 img.math-inline,
 img.math-display {
-  box-sizing: border-box;
-  max-width: 100%;
+  box-sizing: content-box;
+  max-width: calc(100% - 0.16em);
   height: auto;
   background: #fff;
 }
@@ -201,11 +297,11 @@ img.math-inline {
 }
 
 p img.math-inline {
-  max-width: calc(100% - 2em);
+  max-width: calc(100% - 2.16em);
 }
 
 p > img.math-inline:first-child {
-  max-width: calc(100% - 2em);
+  max-width: calc(100% - 2.16em);
 }
 
 li > p > img.math-inline:first-child,
@@ -214,7 +310,7 @@ blockquote p > img.math-inline:first-child,
 .exercise p > img.math-inline:first-child,
 .argument p > img.math-inline:first-child,
 .note p > img.math-inline:first-child {
-  max-width: 100%;
+  max-width: calc(100% - 0.16em);
 }
 
 li > p img.math-inline,
@@ -224,18 +320,33 @@ blockquote p img.math-inline,
 .argument p img.math-inline,
 .note p img.math-inline,
 .titlepage p img.math-inline {
-  max-width: 100%;
+  max-width: calc(100% - 0.16em);
 }
 
-img.math-display {
+img.math-display,
+.display-formula > img.math-display {
   display: block;
-  max-width: 100%;
+  max-width: calc(100% - 0.7em);
   margin: 1em auto;
   padding: 0.35em;
 }
 
+.display-formula img.math-display {
+  max-width: none;
+}
+
+/* Opted-in tables scroll at natural formula width instead of squeezing glyphs. */
+.table-scroll table img.math-inline,
+.table-scroll table p img.math-inline,
+.table-scroll table p > img.math-inline:first-child,
+.table-scroll table img.math-display {
+  max-width: none;
+}
+
 code,
-pre {
+pre,
+.code-example .line-block,
+.binding-example .line-block {
   font-family: "Cascadia Mono", "Sarasa Mono SC", "Noto Sans Mono CJK SC",
     "Courier New", monospace;
   font-variant-ligatures: none;
@@ -250,6 +361,8 @@ pre {
 }
 
 pre {
+  box-sizing: border-box;
+  max-width: 100%;
   margin: 1em 0;
   padding: 0.85em 1em;
   border-left: 0.25em solid #4d8194;
@@ -257,13 +370,15 @@ pre {
   color: #1d2b31;
   font-size: 0.9em;
   line-height: 1.5;
-  white-space: pre-wrap;
+  white-space: pre;
   overflow-x: auto;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
   word-break: normal;
 }
 
 pre code {
+  white-space: inherit;
+  overflow-wrap: normal;
   padding: 0;
   border: 0;
   background: transparent;
@@ -275,6 +390,7 @@ pre > code.sourceCode {
 }
 
 div.sourceCode {
+  max-width: 100%;
   margin: 1em 0;
   border-left: 0.25em solid #4d8194;
   background: #f3f6f7;
@@ -345,7 +461,7 @@ code span.va {
   color: #8a1c3d;
 }
 
-.source-page {
+.source-page:not([role="doc-pagebreak"]) {
   display: none;
 }
 
@@ -357,7 +473,160 @@ code span.va {
 .line-block {
   width: fit-content;
   margin-inline: auto;
+}
+
+.verse {
   white-space: pre-line;
+}
+
+.line-block {
+  white-space: normal;
+}
+
+pre.text {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.code-example,
+.binding-example,
+.code-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.code-table th:first-child,
+.code-table td:first-child {
+  min-width: 4em;
+}
+
+.code-table th:first-child,
+.code-table td:first-child,
+.code-table th:first-child *,
+.code-table td:first-child * {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.code-example .line-block,
+.binding-example .line-block {
+  width: auto;
+  max-width: 100%;
+  margin-inline: 0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.code-example code,
+.binding-example code,
+.code-table code {
+  white-space: pre;
+}
+
+.roman {
+  font-style: normal;
+}
+
+.binding-example code,
+.code-example code,
+.code-table code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.binding-example .binding-context {
+  color: #a3211b;
+  text-decoration: underline solid;
+  text-underline-offset: 0.2em;
+}
+
+.binding-example .binding-macro {
+  color: #005ea8;
+  text-decoration: underline double;
+  text-underline-offset: 0.2em;
+}
+
+.code-change {
+  color: #171b1d;
+  background: #fff18a;
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+}
+
+.type-subject,
+.source-highlight-green {
+  color: #103821;
+  background: #b8e7c5;
+  text-decoration: underline solid;
+  text-underline-offset: 0.2em;
+}
+
+.type-context,
+.source-highlight-blue {
+  color: #082e60;
+  background: #bddaff;
+  text-decoration: underline double;
+  text-underline-offset: 0.2em;
+}
+
+.type-result,
+.source-highlight-yellow {
+  color: #171b1d;
+  background: #fff18a;
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+}
+
+.type-extension,
+.source-highlight-purple {
+  color: #4c195e;
+  background: #ead0f4;
+  text-decoration: underline dashed;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-red {
+  color: #681e1e;
+  background: #fbd0cc;
+  text-decoration: underline wavy;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-pink {
+  color: #65224d;
+  background: #f6d3e8;
+  text-decoration: underline dotted;
+  text-decoration-thickness: 0.14em;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-orange {
+  color: #653000;
+  background: #ffddb0;
+  text-decoration: underline solid;
+  text-decoration-thickness: 0.14em;
+  text-underline-offset: 0.2em;
+}
+
+.source-highlight-green > code,
+.source-highlight-blue > code,
+.source-highlight-yellow > code,
+.source-highlight-purple > code,
+.source-highlight-red > code,
+.source-highlight-pink > code,
+.source-highlight-orange > code,
+.type-subject > code,
+.type-context > code,
+.type-result > code,
+.type-extension > code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
 }
 
 @media (max-width: 30em) {
@@ -371,8 +640,72 @@ code span.va {
 }
 
 @media (prefers-color-scheme: dark) {
-  img.math-inline,
-  img.math-display {
+  .source-highlight-orange {
+    color: #ffdaa6;
+    background: #563500;
+  }
+  .source-highlight-pink {
+    color: #ffd0ea;
+    background: #52263e;
+  }
+  .source-highlight-red {
+    color: #ffb6ae;
+    background: #56252a;
+  }
+  .type-subject,
+  .source-highlight-green {
+    color: #c0f2d4;
+    background: #153f30;
+  }
+
+  .type-context,
+  .source-highlight-blue {
+    color: #a9dcff;
+    background: #17384f;
+  }
+
+  .type-result,
+  .source-highlight-yellow {
+    color: #fff3b0;
+    background: #6b5700;
+  }
+
+  .type-extension,
+  .source-highlight-purple {
+    color: #efcbff;
+    background: #46264e;
+  }
+
+  .code-change {
+    color: #fff3b0;
+    background: #6b5700;
+  }
+
+  .binding-example .binding-context {
+    color: #ffaaaa;
+  }
+
+  .binding-example .binding-macro {
+    color: #82cfff;
+  }
+
+  /* EPUBCheck supports CSS3 selectors, not CSS4 case flags. */
+  img.math-inline[src$=".svg"],
+  img.math-display[src$=".svg"],
+  img.math-inline[src$=".svG"],
+  img.math-display[src$=".svG"],
+  img.math-inline[src$=".sVg"],
+  img.math-display[src$=".sVg"],
+  img.math-inline[src$=".sVG"],
+  img.math-display[src$=".sVG"],
+  img.math-inline[src$=".Svg"],
+  img.math-display[src$=".Svg"],
+  img.math-inline[src$=".SvG"],
+  img.math-display[src$=".SvG"],
+  img.math-inline[src$=".SVg"],
+  img.math-display[src$=".SVg"],
+  img.math-inline[src$=".SVG"],
+  img.math-display[src$=".SVG"] {
     background: #182226;
   }
 

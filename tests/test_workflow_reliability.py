@@ -137,7 +137,10 @@ class WorkflowReliabilityTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
-            work, _, output = self.make_work(Path(directory))
+            work, _, _ = self.make_work(Path(directory))
+            output = Path(directory) / "book.epub"
+            with zipfile.ZipFile(output, "w") as archive:
+                archive.writestr("EPUB/a.xhtml", "<html/>")
             evidence = translator.reset_evidence_child(work, "browser-qa", "en")
             digest = translator.sha256(output)
             modes = []
