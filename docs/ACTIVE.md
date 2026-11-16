@@ -4,4 +4,4 @@
 
 Context Bundle：book 使用翻译规则、EPUB 规则、机器契约及对应 manifest／STATUS；shared-change 使用协议、活动 change 与直接相关契约。
 
-- `shared-change`：来源图形定位接入统一入口 → `docs/changes/source-figure-localization.md`。
+当前无活动共享变更。
