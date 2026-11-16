@@ -53,6 +53,7 @@ Markdown、LaTeX 和 Typst EPUB 使用同一套最终规范化、样式和 QA �
 - Pandoc 先生成保留 `Math` 节点的 JSON AST。
 - 固定版本 GladTeX、LaTeX 和 dvisvgm 在仓库 `.tmp/` 中生成路径 SVG；书籍级 `gladtex.cache` 和已核定 SVG 保存在被忽略的 `Works/<书名>/.cache/svg-math/`。
 - 首次缓存为空时，可从现存正式 EPUB 预热与当前 TeX 和显示类型无歧义匹配的 SVG；后续只编译缓存未命中公式。正文、导航和 EPUB 包仍完整重建。
+- 生成公式的本地 defs／use 字形在规范化时展开为原始 path 与独立 transform 分组，不把平移烘焙进路径坐标；既有主题缓存同样迁移，保持字形、绘制顺序和尺寸，不因表示变化重编译。无法保真解析的生成字形拒绝发布，最终 QA 拒绝生成公式残留 use；保留引用的来源 SVG 必须与正式底稿声明的 Image 及完整 SVG 身份一致，不从主题或 class 猜测来源，来源自带 SVG 不进入该转换。
 - 公式子进程失败时，可以在重新抛出原错误前检查点已经生成的有效缓存项；只接收当前 GladTeX 缓存版本、受限的 `eqnNNN.svg` 路径、有限数值尺寸和通过 SVG 结构校验的资源。失败检查点不能生成或覆盖正式 EPUB，也不能把损坏条目标为命中。
 - 行内和展示公式分别使用 `math-inline`、`math-display`。
 - 来源 EPUB 的栅格行内公式可以读取来源包中静态、无冲突的 `.math-inline-*` CSS 尺寸；构建时把该尺寸写入最终 XHTML 的 `width`、`height` 属性，并以 `em` 高度和 `width: auto` 的内联样式随正文缩放。来源厂商媒体查询只作为输入证据，成品不依赖它们；CSS 缺失、冲突或无法安全解析时保留原尺寸并进入人工复核。

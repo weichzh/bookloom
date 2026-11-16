@@ -20,6 +20,7 @@ import tempfile
 import time
 import tomllib
 import urllib.parse
+from urllib.request import url2pathname
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -31,10 +32,12 @@ from typing import Any
 
 try:
     from tools import epub_browser_qa, epub_source, page_boundary_audit
+    from tools.svg_math_paths import FORMULA_THEME_STYLE, FormulaPathError, expand_local_glyphs
 except ModuleNotFoundError:  # direct ``python tools/translator.py`` execution
     import epub_browser_qa
     import epub_source
     import page_boundary_audit
+    from svg_math_paths import FORMULA_THEME_STYLE, FormulaPathError, expand_local_glyphs
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -4142,7 +4145,7 @@ def pandoc_svg_images(value: Any) -> set[str]:
                 and isinstance(content[2], list)
                 and content[2]
                 and isinstance(content[2][0], str)
-                and content[2][0].lower().endswith(".svg")
+                and urllib.parse.urlsplit(content[2][0]).path.lower().endswith(".svg")
             ):
                 sources.add(content[2][0])
         else:
@@ -4563,6 +4566,10 @@ def normalize_formula_svg(path: Path) -> None:
     if len(view_box) != 4:
         raise CliError(f"公式 SVG 缺少有效 viewBox：{path}")
 
+    try:
+        expanded = expand_local_glyphs(root)
+    except FormulaPathError as error:
+        raise CliError(f"公式 SVG 无法保真展开：{path}；{error}") from error
     children = list(root)
     classes = {child.attrib.get("class") for child in children}
     if {"math-background", "math-foreground"} <= classes and any(
@@ -4570,17 +4577,13 @@ def normalize_formula_svg(path: Path) -> None:
         and "prefers-color-scheme:dark" in "".join(child.itertext())
         for child in children
     ):
+        if expanded:
+            tree.write(path, encoding="utf-8", xml_declaration=True)
         return
     for child in children:
         root.remove(child)
     style = ET.Element(f"{{{SVG_NAMESPACE}}}style")
-    style.text = (
-        ".math-background{fill:#fff}"
-        ".math-foreground,.math-foreground *{fill:#111}"
-        "@media(prefers-color-scheme:dark){"
-        ".math-background{fill:#182226}"
-        ".math-foreground,.math-foreground *{fill:#f5f7f8}}"
-    )
+    style.text = FORMULA_THEME_STYLE
     root.append(style)
     for child in children:
         if child.tag.rsplit("}", 1)[-1] == "defs":
@@ -5322,6 +5325,41 @@ def epub_toc_outline(toc: ET.Element) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def svg_source_identity(data: bytes) -> str:
+    """Canonical XML identity, retaining source text, metadata and comments."""
+    return ET.canonicalize(data, rewrite_prefixes=True, with_comments=True)
+
+
+def declared_source_svg_identities(work: Work, language: Language) -> set[str]:
+    """Bind passthrough SVGs to actual source Image objects, not theme/classes."""
+    text = language.entry.read_text(encoding="utf-8")
+    if work.authoring_format == "latex":
+        text = latex_epub_source_text(language.entry, work.path)
+    document = _pandoc_boundary_ast(work, text, work.authoring_format)
+    paths = pandoc_svg_images(document)
+    if work.authoring_format == "latex":
+        masked = mask_latex_comments(text)
+        for match in re.finditer(r"\\epubfallback\b", masked):
+            start = latex_skip_space(masked, match.end())
+            argument = latex_braced(masked, start)
+            if argument and text[start + 1:argument[1] - 1].lower().endswith(".svg"):
+                paths.add(text[start + 1:argument[1] - 1])
+    identities = set()
+    for raw in paths:
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme == "file" and parsed.netloc in {"", "localhost"}:
+            relative = Path(url2pathname(parsed.path))
+        elif parsed.scheme and not Path(raw).is_absolute():
+            continue
+        else:
+            relative = Path(urllib.parse.unquote(parsed.path if not Path(raw).is_absolute() else raw))
+        source = next((base / relative for base in (language.entry.parent, work.path, work.root)
+                       if (base / relative).is_file()), None)
+        if source is not None:
+            identities.add(svg_source_identity(source.read_bytes()))
+    return identities
+
+
 def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> None:
     if not zipfile.is_zipfile(output):
         raise CliError(f"EPUB 不是有效 ZIP：{output}")
@@ -5592,6 +5630,7 @@ def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> Non
                 documents[member] = document
             except (ET.ParseError, KeyError) as error:
                 raise CliError(f"EPUB 正文文档无效：{member}") from error
+        source_svg_identities: set[str] | None = None
         for member in sorted(set(formula_svg_references)):
             try:
                 svg = ET.fromstring(archive.read(member))
@@ -5603,6 +5642,13 @@ def qa_epub(work: Work, language: Language, output: Path, evidence: Path) -> Non
             ):
                 raise CliError(f"EPUB 公式 SVG 缺少 viewBox：{member}")
             svg_text = "".join(svg.itertext())
+            if work.authoring_format in {"markdown", "latex"} and any(
+                True for _ in svg.iter(f"{{{SVG_NAMESPACE}}}use")
+            ):
+                if source_svg_identities is None:
+                    source_svg_identities = declared_source_svg_identities(work, language)
+                if svg_source_identity(archive.read(member)) not in source_svg_identities:
+                    raise CliError(f"EPUB 生成公式 SVG 残留 use 引用：{member}")
             if not all(
                 marker in svg_text
                 for marker in (
