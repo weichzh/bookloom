@@ -140,6 +140,75 @@ class SourcePixelsTests(unittest.TestCase):
         intact = components.barrier_loss([2, 3, 5, 8], [0, 0, 20, 20], [0, 0, 10, 13])
         self.assertEqual(intact["strict_lost_pixels"], 0)
 
+    @unittest.skipUnless(importlib.util.find_spec("cv2"), "configured CV runtime required")
+    def test_connected_pale_edges_are_retained_but_foreign_core_stays_separate(self):
+        from PIL import Image
+
+        page = Image.new("RGB", (20, 20), "white")
+        page.putpixel((4, 4), (0, 0, 0))
+        page.putpixel((5, 4), (240, 240, 240))
+        page.putpixel((6, 4), (254, 254, 254))
+        page.putpixel((12, 4), (0, 0, 0))
+        page.putpixel((13, 4), (245, 245, 245))
+        components = ink.PageInk(page)
+        box, count, ambiguous = components.bbox([4, 4, 5, 5])
+        self.assertEqual((box, count, ambiguous), ([4, 4, 7, 5], 1, 0))
+        cut = components.barrier_loss([4, 4, 5, 5], [0, 0, 20, 20], [0, 0, 6, 20])
+        self.assertEqual(cut["strict_lost_pixels"], 1)
+        self.assertEqual(components.barrier_loss([4, 4, 5, 5], [0, 0, 20, 20],
+                                                 [0, 0, 7, 20])["strict_lost_pixels"], 0)
+
+        # A pale bridge touching a foreign strong core is not silently absorbed.
+        for x in range(7, 12):
+            page.putpixel((x, 4), (250, 250, 250))
+        box, _, ambiguous = ink.PageInk(page).bbox([4, 4, 5, 5])
+        self.assertEqual(box, [4, 4, 5, 5])
+        self.assertEqual(ambiguous, 1)
+
+    @unittest.skipUnless(importlib.util.find_spec("cv2"), "configured CV runtime required")
+    def test_rgb_only_antialias_survives_model_bcc_and_barrier(self):
+        import numpy as np
+        from PIL import Image
+        from tools import source_figures_model as model
+
+        page = Image.new("RGB", (20, 20), "white")
+        page.putpixel((4, 4), (0, 0, 0))
+        page.putpixel((5, 4), (255, 255, 254))
+        self.assertEqual(page.convert("L").getpixel((5, 4)), 255)
+        adapter = model.LayoutModel.__new__(model.LayoutModel)
+        adapter.inference = mock.Mock()
+        rgb, gray = np.asarray(page), np.asarray(page.convert("L"))
+        adapter.inference.read_page.return_value = (rgb, gray, 20, 20)
+        boxes = np.array([[14, 0.9, 4, 4, 5, 5, 1]], dtype=np.float32)
+        masks = np.zeros((1, 2, 2), dtype=np.uint8)
+        adapter.inference.outputs.return_value = ([boxes, masks], "raw.npz")
+        adapter.handler = mock.Mock()
+        adapter.handler.layout_shape_mode = "auto"
+        adapter.handler._format_output.return_value = [{"boxes": boxes, "masks": masks}]
+        adapter.pp = mock.Mock(return_value=[{"order": 1, "label": "image", "cls_id": 14,
+                                              "score": .9, "coordinate": [4, 4, 5, 5]}])
+        adapter.post = mock.Mock()
+        adapter.names, adapter.metadata = ["boxes", "masks"], {}
+        with mock.patch.object(model, "track_original_indices", return_value=([0], None)):
+            result = adapter.predict("unused.png", "raw.npz")
+        self.assertEqual(result["body_candidates"][0]["Bcc"], [4, 4, 6, 5])
+        loss = adapter.page_ink.barrier_loss([4, 4, 5, 5], [0, 0, 20, 20], [0, 0, 5, 20])
+        self.assertEqual(loss["strict_lost_pixels"], 1)
+
+    @unittest.skipUnless(importlib.util.find_spec("cv2"), "configured CV runtime required")
+    def test_seed_pale_ink_without_core_ownership_requires_review(self):
+        from PIL import Image
+
+        page = Image.new("RGB", (20, 20), "white")
+        page.putpixel((3, 3), (0, 0, 0))
+        page.putpixel((12, 12), (250, 250, 250))
+        components = ink.PageInk(page)
+        box, strong, ambiguous = components.bbox([1, 1, 15, 15])
+        self.assertEqual((box, strong, ambiguous), ([3, 3, 13, 13], 1, 1))
+        check = components.barrier_loss([1, 1, 15, 15], [0, 0, 20, 20], [0, 0, 11, 20])
+        self.assertEqual(check["strict_lost_pixels"], 1)
+        self.assertEqual(check["ambiguous_weak_component_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

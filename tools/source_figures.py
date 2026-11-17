@@ -16,15 +16,18 @@ from typing import Any
 
 try:
     from .browser_runtime import run_hidden
+    from .source_figures_review import summarize_review
 except ImportError:  # translator.py also supports execution as a script
     from browser_runtime import run_hidden
+    from source_figures_review import summarize_review
 
 
 DPI = 225
-ALGORITHM = "source-figures-hcaption-native-v1"
+ALGORITHM = "source-figures-native-groups-v2"
 _FILES = ("source_figures.py", "source_figures_worker.py", "source_figures_model.py",
           "source_figures_panel.py", "source_figures_caption.py", "source_figures_logic.py",
-          "source_figures_inference.py", "source_figures_render.py", "source_figures_ink.py")
+          "source_figures_inference.py", "source_figures_render.py", "source_figures_ink.py",
+          "source_figures_forms.py", "source_figures_review.py")
 _REQUIRED = ("python", "layout_model", "native_jar")
 _OPTIONAL = ("java", "mutool", "cuda_dll_dir", "use_cuda")
 
@@ -115,14 +118,22 @@ def _snapshot(runtime: dict[str, Any], versions: dict[str, Any]) -> dict[str, An
         dependencies["cuda_dll_dir"] = {"path": str(directory),
             "dlls": [_stat(p) for p in sorted(directory.glob("*.dll")) if p.is_file()]}
     inference_code = ("source_figures_inference.py", "source_figures_render.py")
+    worker_versions = versions.get("worker")
+    # Form parsing is an optional postprocessor. Adding it must not invalidate
+    # old model tensors or introduce a new requirement for legacy callers.
+    inference_versions = ({k: v for k, v in worker_versions.items()
+                           if k != "optional_capabilities"}
+                          if isinstance(worker_versions, dict) else worker_versions)
     inference = {"dependencies": {k: dependencies[k] for k in ("python", "layout_model", "mutool")},
                  "use_cuda": runtime["use_cuda"], "versions": {
-                     "worker": versions.get("worker"), "mutool": versions.get("mutool")},
+                     "worker": inference_versions, "mutool": versions.get("mutool")},
                  "dpi": DPI, "code": [_stat(Path(__file__).with_name(n)) for n in inference_code]}
     if "cuda_dll_dir" in dependencies:
         inference["dependencies"]["cuda_dll_dir"] = dependencies["cuda_dll_dir"]
     postprocessing = {"dependencies": {k: dependencies[k] for k in ("native_jar", "java")},
                       "java_version": versions.get("java"), "algorithm": ALGORITHM,
+                      "optional_capabilities": (worker_versions.get("optional_capabilities", {})
+                                                if isinstance(worker_versions, dict) else {}),
                       "code": [_stat(Path(__file__).with_name(n)) for n in _FILES if n not in inference_code]}
     return {"inference": inference, "postprocessing": postprocessing}
 
@@ -263,6 +274,31 @@ def _valid_artifacts(record: dict) -> bool:
         return False
 
 
+def _reusable_source_files(record: dict, artifact_root: Path | None = None):
+    """Reuse rendered inputs only after source/inference binding was retained."""
+    keys = ("png", "svg", "stext", "trace")
+    files = record.get("source_files", {})
+    geometry = record.get("geometry", {})
+    rotation = geometry.get("source_rotation_deg") if isinstance(geometry, dict) else None
+    if (not isinstance(files, dict) or any(not isinstance(files.get(k), str) for k in keys)
+            or type(rotation) is not int or rotation not in {0, 90, 180, 270}):
+        return None
+    try:
+        states = {state["path"]: state for state in record.get("artifact_states", [])}
+        for key in keys:
+            path = Path(files[key])
+            if not path.is_file():
+                return None
+            if artifact_root is not None and not _inside_artifact_root(path, artifact_root):
+                return None
+            state = _stat(path)
+            if states.get(state["path"]) != state:
+                return None
+        return {key: files[key] for key in keys}, rotation
+    except (OSError, RuntimeError, KeyError, TypeError):
+        return None
+
+
 def localize_source(source: Path, pages: list[int], output_dir: Path, runtime_config: Path,
                     *, source_identity: dict, reuse: Path | None = None,
                     artifact_root: Path | None = None) -> dict:
@@ -303,7 +339,8 @@ def localize_source(source: Path, pages: list[int], output_dir: Path, runtime_co
     report = {"schema": 1, "source": binding, "selected_pages": selected,
               "verified": False, "status": "failed", "page_results": [],
               "reuse": {"requested": str(Path(reuse).resolve()) if reuse else None,
-                        "invalidated": [], "reused_pages": [], "reused_raw_pages": []}}
+                        "invalidated": [], "reused_pages": [], "reused_raw_pages": [],
+                        "reused_source_pages": []}}
     try:
         # Validate page bounds before loading or invoking the model worker.
         count_result = _run([runtime["mutool"], "show", source, "trailer/Root/Pages/Count"], env, run_dir)
@@ -337,7 +374,12 @@ def localize_source(source: Path, pages: list[int], output_dir: Path, runtime_co
                 report["reuse"]["reused_raw_pages"].append(page)
             page_dir = run_dir / f"page-{page}"
             page_dir.mkdir()
-            jobs.append({"page": page, "directory": str(page_dir), "reuse_raw": raw})
+            job = {"page": page, "directory": str(page_dir), "reuse_raw": raw}
+            rendered = _reusable_source_files(previous, artifact_root)
+            if rendered is not None:
+                job["reuse_source_files"], job["reuse_rotation_deg"] = rendered
+                report["reuse"]["reused_source_pages"].append(page)
+            jobs.append(job)
         if jobs:
             request = {"source": str(source), "dpi": DPI, "jobs": jobs,
                        "runtime": {k: str(v) if isinstance(v, Path) else v for k, v in runtime.items()}}
@@ -399,6 +441,12 @@ def localize_source(source: Path, pages: list[int], output_dir: Path, runtime_co
         report["error"] = {"type": type(exc).__name__, "message": str(exc)}
     report["pages"] = len(selected)
     report["objects"] = sum(len(p.get("objects", [])) for p in report["page_results"])
+    report["review_summary"] = summarize_review(
+        report["page_results"], run_status=report["status"],
+        run_error=report.get("error"), worker_returncode=report.get("worker_returncode"))
     _write_json(report_path, report)
     return {"report": str(report_path), "status": report["status"], "pages": len(selected),
-            "objects": report["objects"], "verified": False}
+            "objects": report["objects"], "verified": False,
+            "review": {key: report["review_summary"][key] for key in (
+                "required", "run_issues", "review_pages", "review_objects", "page_only_issues",
+                "no_candidate_pages", "coverage")}}

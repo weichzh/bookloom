@@ -14,6 +14,7 @@ try:
     from .browser_runtime import run_hidden
     from . import source_figures_caption as caption
     from . import source_figures_logic as logic
+    from . import source_figures_forms as forms
     from . import source_figures_panel as panel
     from . import source_figures_render as rendering
     from . import source_figures_ink as ink
@@ -21,6 +22,7 @@ except ImportError:  # direct execution by the configured Python
     from browser_runtime import run_hidden
     import source_figures_caption as caption
     import source_figures_logic as logic
+    import source_figures_forms as forms
     import source_figures_panel as panel
     import source_figures_render as rendering
     import source_figures_ink as ink
@@ -40,7 +42,8 @@ def versions():
         not any(k in distributions for k in ("opencv-python", "opencv-python-headless"))):
         raise RuntimeError("configured Python lacks required local model dependencies")
     return {"executable": str(Path(sys.executable).resolve()), "python": sys.version,
-            "platform": platform.platform(), "distributions": distributions}
+            "platform": platform.platform(), "distributions": distributions,
+            "optional_capabilities": {"pypdf": forms.optional_capability()}}
 
 
 def write_json(path, data):
@@ -151,13 +154,22 @@ def _hcaption(body, rectangles, caps, source_image, w, h):
     return result
 
 
-def process_page(job, request, native, native_raw, native_timing, layout):
+def process_page(job, request, native, native_raw, native_timing, layout, native_forms=None):
     from PIL import Image
 
     directory = Path(job["directory"])
     number, source, runtime, dpi = job["page"], request["source"], request["runtime"], request["dpi"]
-    paths = rendering.render(source, number, dpi, runtime, directory, run)
-    rotation = pdf_rotation(runtime["mutool"], source, number, directory)
+    reused = "reuse_source_files" in job or "reuse_rotation_deg" in job
+    if reused:
+        raw_paths, rotation = job.get("reuse_source_files"), job.get("reuse_rotation_deg")
+        if (not isinstance(raw_paths, dict) or set(raw_paths) != {"png", "svg", "stext", "trace"}
+                or any(not isinstance(p, str) or not Path(p).is_file() for p in raw_paths.values())
+                or rotation not in (0, 90, 180, 270)):
+            raise ValueError("invalid reusable source artifacts or rotation")
+        paths = {name: Path(path) for name, path in raw_paths.items()}
+    else:
+        paths = rendering.render(source, number, dpi, runtime, directory, run)
+        rotation = pdf_rotation(runtime["mutool"], source, number, directory)
     raw = directory / "raw.npz"
     predicted = layout.predict(paths["png"], raw,
                                reuse_raw=Path(job["reuse_raw"]) if job["reuse_raw"] else None)
@@ -172,34 +184,131 @@ def process_page(job, request, native, native_raw, native_timing, layout):
             record["bbox_display_pt"], md["mutool_display_pt_to_pixel_affine"])
     placements = logic.native_images(paths["trace"], scale, w, h)
     bodies = predicted["body_candidates"]
-    pairs, page_reasons = logic.pair_captions(bodies, caps, scale)
+    native_forms = forms.pixel_placements(native_forms or {
+        "available": False, "status": "unavailable", "reasons": ["pypdf_unavailable"],
+        "placements": []}, scale, w, h)
+    form_placements = native_forms["placements"]
+    groups = logic.native_form_groups(bodies, caps, form_placements, scale)
+    page_ink = getattr(layout, "page_ink", None)
+    if not isinstance(page_ink, ink.PageInk):
+        page_ink = None
+    region_checks = []
+    if groups:
+        if page_ink is None:
+            with Image.open(paths["png"]) as page_image:
+                page_ink = ink.PageInk(page_image)
+        accepted = []
+        for group in groups:
+            region = logic.outward(logic._region(caps[group["caption_index"]], scale), w, h)
+            check = page_ink.region_consistency(group["form"]["bbox_px"], region)
+            check["seed_visible_pixels"] = [page_ink.visible_pixels(logic.outward(bodies[i]["B"], w, h))
+                                             for i in group["seed_indices"]]
+            if check["status"] == "consistent" and not all(check["seed_visible_pixels"]):
+                check["status"] = "seed_has_no_visible_ink"
+            check.update(form_id=group["form"]["id"], caption_index=group["caption_index"],
+                         model_candidate_ids=[bodies[i]["candidate_id"] for i in group["seed_indices"]])
+            region_checks.append(check)
+            if check["status"] == "consistent":
+                group["region_consistency"] = check
+                accepted.append(group)
+        groups = accepted
+    grouped = {i: group for group in groups for i in group["seed_indices"]}
+    consumed_caps = {g["caption_index"] for g in groups}
+    units = []
+    for i, body in enumerate(bodies):
+        if i in grouped:
+            group = grouped[i]
+            if i != group["seed_indices"][0]:
+                continue
+            units.append({"seeds": [bodies[j] for j in group["seed_indices"]],
+                          "form": group["form"], "caption_index": group["caption_index"],
+                          "region_consistency": group["region_consistency"]})
+        else:
+            units.append({"seeds": [body], "form": None, "caption_index": None})
+    remaining_units = [i for i, unit in enumerate(units) if unit["form"] is None]
+    remaining_caps = [i for i in range(len(caps)) if i not in consumed_caps]
+    page_reasons = []
+    if remaining_units or remaining_caps:
+        local_pairs, page_reasons = logic.pair_captions(
+            [units[i]["seeds"][0] for i in remaining_units], [caps[i] for i in remaining_caps], scale)
+        for i, j in local_pairs.items():
+            units[remaining_units[i]]["caption_index"] = remaining_caps[j]
+    if any(check["status"] == "unassociated_ink" for check in region_checks):
+        page_reasons.append("native_form_region_contains_unassociated_visible_ink")
+    if any(check["status"] in ("no_visible_ink", "seed_has_no_visible_ink") for check in region_checks):
+        page_reasons.append("native_form_or_seed_has_no_visible_ink")
     if text_error:
         page_reasons.append(text_error)
+    if (bodies or caps or form_placements or placements) and any(
+            line.get("error") for block in blocks for line in block):
+        page_reasons.append("source_glyph_geometry_unavailable")
+    if removed:
+        page_reasons.append("source_text_illegal_xml_characters_removed")
+    if native_forms["status"] == "unsupported":
+        page_reasons.append("native_form_extraction_unsupported")
     if any(not p["eligible"] and p["page_fraction"] > 0.8 for p in placements):
         page_reasons.append("page_sized_native_image_requires_review")
+    if any(p["page_sized"] and p["parent_id"] is None for p in form_placements):
+        page_reasons.append("page_sized_native_form_requires_review")
+    root_forms = [p for p in form_placements if p["parent_id"] is None]
+    if not bodies and root_forms:
+        page_reasons.append("native_form_without_model_seed")
+    if not bodies and placements:
+        page_reasons.append("native_image_without_model_seed")
     objects = []
     with Image.open(paths["png"]) as image:
         image = image.convert("RGB")
-        page_ink = None
-        for index, body in enumerate(bodies):
+        for index, unit in enumerate(units):
+            body, form = unit["seeds"][0], unit["form"]
+            cap_index = unit["caption_index"]
             reasons = []
-            route = _hcaption(body, records, caps, image, w, h)
-            matches = logic.select_native_images(body["B"], placements)
-            if len(matches) > 1:
+            if not form and body.get("ambiguous_weak_component_count", 0):
+                reasons.append("connected_pale_edge_ownership_ambiguous")
+            route = ({"branch": "native_form_viewport", "bbox_px": form["bbox_px"], "status": "ok"}
+                     if form else _hcaption(body, records, caps, image, w, h))
+            matches = ([p for p in placements if logic.intersection(form["bbox_px"], p["bbox_px"])]
+                       if form else logic.select_native_images(body["B"], placements))
+            if not form and len(matches) > 1:
                 reasons.append("multiple_native_images_for_one_seed")
-            if (len(matches) == 1 and logic.intersection(body["B"], matches[0]["continuous_bbox_px"])
+            if (not form and len(matches) == 1 and logic.intersection(body["B"], matches[0]["continuous_bbox_px"])
                     / logic.area(body["B"]) < 0.8):
                 reasons.append("native_image_covers_only_part_of_seed")
-            if any(m["clip_status"] == "unresolved" for m in matches):
+            if not form and any(m["clip_status"] == "unresolved" for m in matches):
                 reasons.append("native_image_clip_not_proven_to_contain_placement")
-            glyphs = logic.independent_glyph_lines(blocks, body["B"], caps, scale)
-            unproven_glyphs = logic.unproven_glyph_ownership(glyphs, matches)
+            glyphs = logic.independent_glyph_lines(blocks, form["bbox_px"] if form else body["B"], caps, scale)
+            if form:
+                proven_glyphs, unproven_glyphs = logic.form_glyph_ownership(
+                    form, form_placements, blocks, caps, scale)
+                proven_images, unproven_images = logic.form_image_ownership(
+                    form, matches, native_forms["image_invocations"])
+                if unproven_images:
+                    reasons.append("native_form_intersects_unassociated_image")
+                for other in root_forms:
+                    if (other["id"] != form["id"] and other["id"] not in form["ancestor_ids"] and
+                            logic.intersection(other["bbox_px"], form["bbox_px"])):
+                        reasons.append("native_form_intersects_other_form")
+                        break
+                region = logic._region(caps[cap_index], scale)
+                if any(seed not in unit["seeds"] and logic.intersection(seed["B"], region) for seed in bodies):
+                    reasons.append("native_caption_region_contains_unassociated_seed")
+                if any(other["id"] != form["id"] and other["id"] not in form["ancestor_ids"]
+                       and logic.intersection(other["bbox_px"], region) for other in root_forms):
+                    reasons.append("native_caption_region_contains_other_form")
+            else:
+                proven_glyphs = []
+                proven_images, unproven_images = [], []
+                unproven_glyphs = logic.unproven_glyph_ownership(glyphs, matches)
+                for other in form_placements:
+                    if (not other["eligible"] and logic.area(body["B"]) and
+                            logic.intersection(body["B"], other["continuous_bbox_px"]) / logic.area(body["B"]) >= 0.8):
+                        reasons.append("native_form_geometry_or_clip_unresolved")
+                        break
             if unproven_glyphs:
                 reasons.append("native_glyph_ownership_unproven")
             boxes = []
             if route["bbox_px"]:
                 boxes.append(route["bbox_px"])
-            if len(matches) == 1:
+            if not form and len(matches) == 1:
                 boxes.append(matches[0]["bbox_px"])
                 # Independent legend glyphs can lie outside the image XObject.
                 boxes.extend(g["bbox_px"] for g in glyphs)
@@ -215,10 +324,13 @@ def process_page(job, request, native, native_raw, native_timing, layout):
                     reasons.append("empty_body")
             if route.get("selected_panel", {}).get("clip_paths"):
                 reasons.append("native_panel_clipping_requires_review")
-            if index not in pairs:
+            if cap_index is None:
                 reasons.append("caption_owner_unresolved")
-            uncovered = (logic.uncovered_region_glyphs(crop, caps[pairs[index]], blocks, caps, scale)
-                         if index in pairs else [])
+            uncovered = (logic.uncovered_region_glyphs(crop, caps[cap_index], blocks, caps, scale)
+                         if cap_index is not None else [])
+            uncovered, metric_overhangs = logic.split_form_metric_overhangs(
+                uncovered, form if native_forms["status"] == "ok" else None,
+                form_placements, crop, proven_glyphs)
             if uncovered:
                 reasons.append("native_region_contains_uncovered_glyphs")
             caption_intrusions = logic.overlapping_caption_bounds(crop, caps)
@@ -236,6 +348,8 @@ def process_page(job, request, native, native_raw, native_timing, layout):
                 seed_ink_check = page_ink.barrier_loss(logic.outward(body["B"], w, h), selected, crop)
                 if seed_ink_check["strict_lost_pixels"]:
                     reasons.append("caption_barrier_cuts_seed_connected_ink")
+                if seed_ink_check.get("ambiguous_weak_component_count", 0):
+                    reasons.append("caption_barrier_pale_edge_ownership_ambiguous")
             image_path = None
             if crop is not None:
                 image_path = directory / f"figure-{index + 1}.png"
@@ -243,16 +357,27 @@ def process_page(job, request, native, native_raw, native_timing, layout):
             losses = ([logic.rectangle_loss_pixels(m["bbox_px"], crop) for m in matches]
                       if crop is not None else [])
             objects.append({"candidate_id": body["candidate_id"], "model_seed": body,
+                            "model_seeds": unit["seeds"], "native_form": form,
+                            "provenance": {"geometry": "native_form_viewport" if form else "model_and_native_images",
+                                           "model_candidate_ids": [s["candidate_id"] for s in unit["seeds"]],
+                                           "native_form_id": form["id"] if form else None,
+                                           "caption_index": cap_index,
+                                           "region_consistency": unit.get("region_consistency")},
                             "bbox_xyxy_px": crop, "image": str(image_path) if image_path else None,
                             "native_image_placements": matches,
+                            "proven_native_form_images": proven_images,
+                            "unproven_native_form_images": unproven_images,
                             "native_placement_lost_pixels": losses,
+                            "native_placement_loss_meaning": "rectangle_area_not_visible_pixel_loss",
                             "independent_glyph_lines": glyphs, "hcaption": route,
+                            "proven_native_form_glyphs": proven_glyphs,
                             "unproven_glyph_ownership": unproven_glyphs,
                             "uncovered_native_region_glyphs": uncovered,
+                            "native_form_metric_overhangs": metric_overhangs,
                             "seed_connected_ink_check": seed_ink_check,
                             "caption_intrusions": caption_intrusions,
                             "unassigned_text_intrusions": unassigned_text,
-                            "caption": caps[pairs[index]] if index in pairs else None,
+                            "caption": caps[cap_index] if cap_index is not None else None,
                             "status": "needs_review" if reasons else "candidate", "reasons": reasons})
     for i, first in enumerate(objects):
         for second in objects[i + 1:]:
@@ -266,17 +391,34 @@ def process_page(job, request, native, native_raw, native_timing, layout):
                 for obj in (first, second):
                     obj["reasons"].append("candidate_ownership_or_bounds_overlap")
                     obj["status"] = "needs_review"
-    if not objects:
-        page_reasons.append("no_model_body_candidates")
+    claimed = {p["id"] for group in groups for p in form_placements
+               if p["id"] == group["form"]["id"] or p["id"] in group["form"]["ancestor_ids"]}
+    if bodies and any(p["id"] not in claimed for p in root_forms):
+        page_reasons.append("native_form_without_resolved_group")
+    used_images = {p["id"] for obj in objects for p in obj["native_image_placements"]}
+    if bodies and any(p["id"] not in used_images for p in placements):
+        page_reasons.append("native_image_without_resolved_candidate")
+    for obj in objects:
+        obj["reasons"] = list(dict.fromkeys(obj["reasons"]))
+        obj["review_required"] = bool(obj["reasons"])
+        obj["review_reasons"] = list(obj["reasons"])
+    page_reasons = list(dict.fromkeys(page_reasons))
+    no_candidates = not bodies and not caps and not page_reasons
+    review_required = bool(page_reasons or any(obj["review_required"] for obj in objects))
     deps = [str(p) for p in paths.values()] + [str(native_raw), str(native_timing),
             predicted["raw_tensor_npz"]] + [o["image"] for o in objects if o["image"]]
-    return {"page": number, "status": "needs_review" if page_reasons or any(
-                o["status"] == "needs_review" for o in objects) else "candidates",
+    return {"page": number, "status": "needs_review" if review_required else "candidates",
             "verified": False, "reasons": page_reasons, "dpi": dpi,
+            "review_required": review_required, "review_reasons": list(page_reasons),
+            "no_candidates": no_candidates, "information": ["no_candidates"] if no_candidates else [],
+            "coverage": "not_established",
+            "source_artifacts_reused": reused,
+            "grouped_seed_count": sum(len(g["seed_indices"]) for g in groups if len(g["seed_indices"]) > 1),
             "width_px": w, "height_px": h, "geometry": geometry,
             "source_files": {k: str(v) for k, v in paths.items()},
             "caption_alignment": caps, "source_text_error": text_error,
-            "illegal_xml_characters_removed": removed, "native_images": placements,
+            "illegal_xml_characters_removed": removed, "native_images": placements, "native_forms": native_forms,
+            "native_form_region_checks": region_checks,
             "panel_rejected_nonrectangles": len(nonrect), "skipped_svg_elements": skipped,
             "model_prediction": predicted, "objects": objects, "dependencies": deps}
 
@@ -294,6 +436,7 @@ def execute(request_path):
         for job in jobs:
             write_json(Path(job["directory"]) / "result.json", {"page": job["page"], **detail})
         return 1
+    native_forms = forms.extract(request["source"], [job["page"] for job in jobs])
     layout = None
     failed = False
     for job in jobs:
@@ -302,7 +445,7 @@ def execute(request_path):
                 from source_figures_model import LayoutModel
                 rt = request["runtime"]
                 layout = LayoutModel(rt["layout_model"], rt["use_cuda"], rt["cuda_dll_dir"])
-            result = process_page(job, request, native, raw, timing, layout)
+            result = process_page(job, request, native, raw, timing, layout, native_forms[job["page"]])
         except Exception as exc:
             failed = True
             result = {"page": job["page"], "status": "failed", "error": f"{type(exc).__name__}: {exc}",

@@ -20,3 +20,4 @@
 | [docs/codebase/SOURCE_FIGURES.md](codebase/SOURCE_FIGURES.md) | 来源图形 runtime、候选状态、来源绑定与增量复用 | book, shared-change |
 | [docs/workflow/TRANSLATION.md](workflow/TRANSLATION.md) | 内容恢复、翻译与交付流程 | book |
 | [docs/workflow/EPUB.md](workflow/EPUB.md) | EPUB 生成与验收 | book, shared-change |
+| [docs/changes/native-figure-groups.md](changes/native-figure-groups.md) | 已接受的原生图组与复核减负范围 | shared-change |

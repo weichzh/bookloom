@@ -162,7 +162,17 @@ class LayoutModel:
         trace, reason = track_original_indices(boxes, masks, self.pp, [w, h], captured, self.post)
         if trace is None:
             raise ValueError(f"model original-row identity unavailable: {reason}")
-        labels, stats = page_components((255 - gray.astype(np.int16)) > 16)
+        if any(result["label"] in {"image", "chart", "table"} for result in results):
+            try:
+                from .source_figures_ink import PageInk
+            except ImportError:
+                from source_figures_ink import PageInk
+            page_ink = PageInk(image, gray=gray)
+        else:
+            page_ink = None
+        # The worker reuses this page's visible masks for its Form region and
+        # caption-barrier checks, without classifying the original page again.
+        self.page_ink = page_ink
         all_predictions, bodies = [], []
         for position, result in enumerate(results):
             index = int(result["order"]) - 1
@@ -179,8 +189,10 @@ class LayoutModel:
             }
             all_predictions.append(candidate)
             if result["label"] in {"image", "chart", "table"}:
-                box, ids = bcc(labels, stats, candidate["B"])
-                bodies.append({**candidate, "Bcc": box, "component_count": int(len(ids))})
+                seed = outward_bbox(candidate["B"], w, h)
+                box, count, ambiguous = page_ink.bbox(seed)
+                bodies.append({**candidate, "Bcc": box, "component_count": count,
+                               "ambiguous_weak_component_count": ambiguous})
         return {
             "width_px": w, "height_px": h, "raw_tensor_npz": str(used_raw),
             "raw_tensors": [

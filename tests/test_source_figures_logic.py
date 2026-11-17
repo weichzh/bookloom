@@ -154,6 +154,44 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual([v["line_id"] for v in missing], ["legend"])
         self.assertEqual(logic.uncovered_region_glyphs([1, 1, 9, 9], cap, blocks, [cap], 1), [])
 
+    def test_native_form_glyph_metric_overhang_requires_proven_complete_clipped_viewport(self):
+        glyph = {"id": "axis:glyph-0", "text": "0", "bbox_pt": [9, 2, 19, 4]}
+        blocks = [[{"id": "axis", "text": "0", "error": None, "glyphs": [glyph]}]]
+        cap = aligned([1, 12, 8, 14], [0, 0, 20, 10])
+        crop = [0, 0, 10, 10]
+        form = {"id": "form", "ancestor_ids": [], "eligible": True, "axis_aligned": True,
+                "clip_status": "fully_contained", "form_bbox": [0, 0, 10, 10],
+                "display_transform": [1, 0, 0, 1, 0, 0], "bbox_px": crop,
+                "continuous_bbox_px": [0, 0, 10, 10],
+                "text_glyph_origins": [{"text": "0", "origin_display_pt": [9, 4],
+                                        "font_height_pt": 4}]}
+        missed = logic.uncovered_region_glyphs(crop, cap, blocks, [cap], 1)
+        self.assertEqual(missed[0]["glyphs"][0]["glyph_id"], "axis:glyph-0")
+        proven, unproven = logic.form_glyph_ownership(form, [form], blocks, [cap], 1)
+        self.assertEqual(unproven, [])
+        remaining, information = logic.split_form_metric_overhangs(missed, form, [form], crop, proven)
+        self.assertEqual(remaining, [])
+        self.assertEqual(information[0]["bbox_px"], [9, 2, 19, 4])
+
+        foreign_glyph = {"id": "axis:glyph-1", "text": "X", "bbox_pt": [9, 5, 15, 7]}
+        mixed = [[{"id": "axis", "text": "0X", "error": None, "glyphs": [glyph, foreign_glyph]}]]
+        mixed_missed = logic.uncovered_region_glyphs(crop, cap, mixed, [cap], 1)
+        mixed_proven, _ = logic.form_glyph_ownership(form, [form], mixed, [cap], 1)
+        remaining, information = logic.split_form_metric_overhangs(mixed_missed, form, [form], crop, mixed_proven)
+        self.assertEqual([g["glyph_id"] for g in remaining[0]["glyphs"]], ["axis:glyph-1"])
+        self.assertEqual([g["glyph_id"] for g in information[0]["glyphs"]], ["axis:glyph-0"])
+
+        # Neither a foreign source glyph nor an ambiguous clip can use the
+        # Form's BBox clipping as evidence of preserved visible pixels.
+        self.assertEqual(logic.split_form_metric_overhangs(missed, form, [form], crop, [])[0], missed)
+        other = [{**proven[0], "form_id": "other-form"}]
+        self.assertEqual(logic.split_form_metric_overhangs(missed, form, [form], crop, other)[0], missed)
+        unknown_clip = {**form, "clip_status": "unknown"}
+        self.assertEqual(logic.split_form_metric_overhangs(missed, unknown_clip, [unknown_clip], crop, proven)[0], missed)
+        self.assertEqual(logic.split_form_metric_overhangs(missed, form, [form], [0, 0, 9, 10], proven)[0], missed)
+        no_native_bbox = {**form, "form_bbox": None}
+        self.assertEqual(logic.split_form_metric_overhangs(missed, no_native_bbox, [no_native_bbox], crop, proven)[0], missed)
+
     def test_model_overlap_does_not_itself_establish_legend_ownership(self):
         glyphs = [{"line_id": "legend", "bbox_px": [6, 2, 8, 4]}]
         self.assertEqual(logic.unproven_glyph_ownership(glyphs, []), glyphs)

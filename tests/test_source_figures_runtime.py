@@ -175,6 +175,79 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("page count", self.read(result)["error"]["message"])
         self.assertEqual(self.calls, [])
+        self.assertTrue(result["review"]["required"])
+        self.assertEqual(result["review"]["run_issues"], 1)
+        self.assertEqual(self.read(result)["review_summary"]["queue"][0]["scope"], "run")
+
+    def test_version_detection_failure_keeps_global_review_action(self):
+        with (mock.patch.object(figures, "_versions", side_effect=RuntimeError("version probe failed")),
+              mock.patch.object(figures, "_run", return_value=subprocess.CompletedProcess([], 0, "3\n", ""))):
+            result = figures.localize_source(self.source, [1], self.output, self.config,
+                                              source_identity={"work_id": "synthetic"})
+        report = self.read(result)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(report["page_results"], [])
+        self.assertTrue(result["review"]["required"])
+        self.assertEqual(result["review"]["run_issues"], 1)
+        self.assertEqual(report["review_summary"]["queue"][0]["error"]["type"], "RuntimeError")
+
+    def test_source_changed_after_good_pages_remains_global_failure(self):
+        base_worker = self.fake_worker
+        def changed_source(command, **kwargs):
+            result = base_worker(command, **kwargs)
+            self.source.write_bytes(b"source changed after successful page processing")
+            return result
+        with mock.patch.object(self, "fake_worker", side_effect=changed_source):
+            result = self.localize(pages=(1,))
+        report = self.read(result)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(report["page_results"][0]["status"], "candidates")
+        self.assertTrue(result["review"]["required"])
+        self.assertEqual(result["review"]["run_issues"], 1)
+        self.assertIn("source changed", report["review_summary"]["queue"][0]["error"]["message"])
+
+    def test_worker_failure_after_content_warning_keeps_both_actions(self):
+        base_worker = self.fake_worker
+        def crashed_after_warning(command, **kwargs):
+            base_worker(command, **kwargs)
+            request = json.loads(Path(command[-1]).read_text(encoding="utf8"))
+            path = Path(request["jobs"][0]["directory"]) / "result.json"
+            page = json.loads(path.read_text(encoding="utf8"))
+            page.update(status="needs_review", reasons=["caption_body_ownership_not_unique"])
+            path.write_text(json.dumps(page), encoding="utf8")
+            return subprocess.CompletedProcess(command, 1, "", "worker crashed after a page warning")
+        with mock.patch.object(self, "fake_worker", side_effect=crashed_after_warning):
+            result = self.localize(pages=(1,))
+        self.assertEqual(result["status"], "failed")
+        summary = self.read(result)["review_summary"]
+        self.assertEqual(summary["run_issues"], 1)
+        self.assertEqual(summary["page_only_issues"], 1)
+        self.assertEqual(summary["queue"][0]["worker_returncode"], 1)
+
+    def test_missing_artifact_keeps_page_failure_with_content_warning(self):
+        base_worker = self.fake_worker
+        for object_warning in (True, False):
+            with self.subTest(object_warning=object_warning):
+                def missing_artifact(command, **kwargs):
+                    result = base_worker(command, **kwargs)
+                    request = json.loads(Path(command[-1]).read_text(encoding="utf8"))
+                    path = Path(request["jobs"][0]["directory"]) / "result.json"
+                    page = json.loads(path.read_text(encoding="utf8"))
+                    page.update(status="needs_review", reasons=["caption_body_ownership_not_unique"])
+                    if object_warning:
+                        page["objects"][0].update(status="needs_review", reasons=["caption_owner_unresolved"])
+                    Path(page["objects"][0]["image"]).unlink()
+                    path.write_text(json.dumps(page), encoding="utf8")
+                    return result
+                with mock.patch.object(self, "fake_worker", side_effect=missing_artifact):
+                    result = self.localize(pages=(1,))
+                report = self.read(result)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(report["review_summary"]["run_issues"], 0)
+                item = report["review_summary"]["queue"][0]
+                self.assertEqual(item["error"], "worker_artifacts_missing")
+                self.assertEqual(item["page_status"], "failed")
+                self.assertIn("worker_artifacts_missing", item.get("page_context", item["reasons"]))
 
     def test_runtime_paths_are_relative_to_config_and_cpu_is_default(self):
         result = figures.load_runtime(self.config)
